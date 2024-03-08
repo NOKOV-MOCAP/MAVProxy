@@ -1,7 +1,7 @@
 from setuptools import setup
 import os, platform, sys
 
-version = "1.8.69"
+version = "1.8.70"
 
 def package_files(directory):
     paths = []
@@ -28,7 +28,8 @@ package_data.extend(package_files('MAVProxy/modules/mavproxy_cesium/app'))
 # large numbers of modules like numpy etc which may be already installed
 requirements=['pymavlink>=2.4.14',
               'pyserial>=3.0',
-              'numpy']
+              'numpy',
+              'pynmeagps']
 
 if platform.system() == "Darwin":
     # on MacOS we can have a more complete requirements list

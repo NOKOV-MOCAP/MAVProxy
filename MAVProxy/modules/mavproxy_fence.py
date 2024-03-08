@@ -167,6 +167,9 @@ class FenceModule(mission_item_protocol.MissionItemProtocolModule):
             return p
         return None
 
+    def mission_ftp_name(self):
+        return "@MISSION/fence.dat"
+
     @staticmethod
     def loader_class():
         return mavwp.MissionItemProtocol_Fence
@@ -218,7 +221,7 @@ class FenceModule(mission_item_protocol.MissionItemProtocolModule):
             self.console.set_status('Fence', 'FEN', row=0, fg='red')
 
     def mavlink_packet(self, m):
-        if m.get_type() == 'SYS_STATUS':
+        if m.get_type() == 'SYS_STATUS' and self.message_is_from_primary_vehicle(m):
             self.handle_sys_status(m)
         super(FenceModule, self).mavlink_packet(m)
 
@@ -285,7 +288,7 @@ class FenceModule(mission_item_protocol.MissionItemProtocolModule):
         if not self.check_have_list():
             return
         if len(args) < 2:
-            print("Need 2 arguments")
+            print("Usage: fence setcircle inclusion|exclusion RADIUS")
             return
         t = args[0]
         radius = float(args[1])
@@ -442,6 +445,21 @@ class FenceModule(mission_item_protocol.MissionItemProtocolModule):
         self.wploader.last_change = time.time()
         self.send_all_items()
 
+    def cmd_setcircleradius(self, args):
+        if len(args) < 1:
+            print("fence setcircleradius INDEX RADIUS")
+            return
+
+        if len(args) < 2:
+            # this one will use the click position:
+            self.setcircleradius(int(args[0]))
+            return
+
+        self.setcircleradius(int(args[0]), radius=float(args[1]))
+
+    def cmd_movecircle(self, args):
+        self.movecircle(int(args[0]))
+
     def removecircle(self, seq):
         '''remove circle at offset seq'''
         if not self.check_have_list():
@@ -458,6 +476,79 @@ class FenceModule(mission_item_protocol.MissionItemProtocolModule):
         self.wploader.expected_count -= 1
         self.wploader.last_change = time.time()
         self.send_all_items()
+
+    def movecircle(self, seq):
+        '''moves circle at polygon_start_seqence to map click point
+        '''
+        if not self.check_have_list():
+            return
+
+        item = self.wploader.item(seq)
+        if item is None:
+            print("No item %s" % str(seq))
+            return
+
+        if not self.is_circle_item(item):
+            print("Item %u is not a circle" % seq)
+            return
+
+        latlon = self.mpstate.click_location
+        if latlon is None:
+            print("No map click position available")
+            return
+
+        moving_item = self.wploader.item(seq)
+        moving_item.x = latlon[0]
+        moving_item.y = latlon[1]
+        if moving_item.get_type() == "MISSION_ITEM_INT":
+            moving_item.x *= 1e7
+            moving_item.y *= 1e7
+            moving_item.x = int(moving_item.x)
+            moving_item.y = int(moving_item.y)
+
+        self.wploader.set(moving_item, moving_item.seq)
+        self.wploader.last_change = time.time()
+
+        self.send_single_waypoint(moving_item.seq)
+
+    def setcircleradius(self, seq, radius=None):
+        '''change radius of circle at seq to radius
+        '''
+        if not self.check_have_list():
+            return
+
+        item = self.wploader.item(seq)
+        if item is None:
+            print("No item %s" % str(seq))
+            return
+
+        if not self.is_circle_item(item):
+            print("Item %u is not a circle" % seq)
+            return
+
+        if radius is None:
+            # calculate radius from clock position:
+            latlon = self.mpstate.click_location
+            if latlon is None:
+                print("No click position available")
+                return
+            item_x = item.x
+            item_y = item.y
+            if item.get_type() == 'MISSION_ITEM_INT':
+                item_x *= 1e-7
+                item_y *= 1e-7
+            radius = mavextra.distance_lat_lon(latlon[0], latlon[1], item_x, item_y)
+        elif radius <= 0:
+            print("radius must be positive")
+            return
+
+        changing_item = self.wploader.item(seq)
+        changing_item.param1 = radius
+
+        self.wploader.set(changing_item, changing_item.seq)
+        self.wploader.last_change = time.time()
+
+        self.send_single_waypoint(changing_item.seq)
 
     def is_circle_item(self, item):
         return item.command in [
@@ -678,6 +769,8 @@ class FenceModule(mission_item_protocol.MissionItemProtocolModule):
         ret = super(FenceModule, self).commands()
         ret.update({
             'addcircle': (self.cmd_addcircle, ["<inclusion|inc|exclusion|exc>", "RADIUS"]),
+            'movecircle': (self.cmd_movecircle, []),
+            'setcircleradius': (self.cmd_setcircleradius, ["seq radius"]),
             'addpoly': (self.cmd_addpoly, ["<inclusion|inc|exclusion|exc>", "<radius>" "<pointcount>", "<rotation>"]),
             'movepolypoint': (self.cmd_movepolypoint, ["POLY_FIRSTPOINT", "POINT_OFFSET"]),
             'addreturnpoint': (self.cmd_addreturnpoint, []),

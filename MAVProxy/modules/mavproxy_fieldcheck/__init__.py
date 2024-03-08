@@ -109,12 +109,18 @@ class FieldCheck(object):
     def check_parameters(self, fix=False):
         '''check key parameters'''
         want_values = {
-            "FENCE_ACTION": 4,
+            "FENCE_ENABLE": 1,
+            "FENCE_ACTION": 1,  # 4 is break-or-land on Copter!
             "FENCE_ALT_MAX": self.fc_settings.param_fence_maxalt,
             "THR_FAILSAFE": 1,
             "FS_SHORT_ACTN": 0,
             "FS_LONG_ACTN": 1,
         }
+
+        if self.vehicle_type == mavutil.mavlink.MAV_TYPE_FIXED_WING:
+            want_values["FENCE_ACTION"] = 1  # RTL
+        elif self.vehicle_type == mavutil.mavlink.MAV_TYPE_QUADROTOR:
+            want_values["FENCE_ACTION"] = 4  # Brake or RTL
 
         ret = True
         for key in want_values.keys():
@@ -129,6 +135,23 @@ class FieldCheck(object):
                 if fix:
                     self.whinge('Setting %s to %f' % (key, want))
                     self.mav_param.mavset(self.master, key, want, retries=3)
+
+        # ensure there is a fence enable/disable switch configured:
+        required_options = {
+            11: "Fence Enable/Disable",
+        }
+        for required_option in required_options.keys():
+            found = False
+            for chan in range(1, 17):
+                rc_option_param_name = f"RC{chan}_OPTION"
+                got = self.mav_param.get(rc_option_param_name, None)
+                if got == required_option:
+                    found = True
+                    break
+            if not found:
+                self.whinge("RC channel option %u (%s) must be configured" %
+                            (required_option, required_options[required_option]))
+                ret = False
 
         return ret
 
@@ -330,7 +353,9 @@ class FieldCheck(object):
     def mavlink_packet(self, m):
         '''handle an incoming mavlink packet'''
         if not self.done_heartbeat_check:
-            if self.master.messages.get('HEARTBEAT') is not None:
+            m = self.master.messages.get('HEARTBEAT')
+            if m is not None:
+                self.vehicle_type = m.type
                 self.check()
                 self.done_heartbeat_check = True
 
