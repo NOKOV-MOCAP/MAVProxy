@@ -8,12 +8,13 @@ MAVProxyAny = Analysis(['mavproxy.py'],
              # all the needed pieces, so we also import them in mavproxy.py
              hiddenimports=['cv2', 'wx', 'pylab', 
                             'numpy', 'dateutil', 'matplotlib',
-                            'HTMLParser', 'wx.grid', 'wx._grid', 'prompt-toolkit',
+                            'HTMLParser', 'wx.grid', 'wx._grid', 'prompt_toolkit',
                             'wx.lib.agw.genericmessagedialog', 'wx.lib.wordwrap', 'wx.lib.buttons',
                             'wx.lib.embeddedimage', 'wx.lib.imageutils', 'wx.lib.agw.aquabutton', 
-                            'wx.lib.agw.gradientbutton', 'wxversion', 'UserList', 'UserString',
+                            'wx.lib.agw.gradientbutton',
                             'six','packaging', 'packaging.version', 'packaging.specifiers',
-                            'pkg_resources.py2_warn'] + collect_submodules('MAVProxy.modules') + 
+                            'requests', 'future',
+                            ] + collect_submodules('MAVProxy.modules') + 
                             collect_submodules('pymavlink') + collect_submodules('yaml') + collect_submodules('pygame'),
              datas= [ ('modules\\mavproxy_map\\data\\*.*', 'MAVProxy\\modules\\mavproxy_map\\data' ),
                       ('modules\\mavproxy_joystick\\joysticks\\*.*', 'MAVProxy\\modules\\mavproxy_joystick\\joysticks' )],
@@ -26,16 +27,31 @@ MAVExpAny = Analysis(['.\\tools\\MAVExplorer.py'],
              # all the needed pieces, so we also import them in mavproxy.py
              hiddenimports=['cv2', 'wx', 'pylab', 
                             'numpy', 'dateutil', 'matplotlib',
-                            'prompt-toolkit', 'HTMLParser', 'wx.grid', 'wx._grid',
+                            'requests',
+                            'prompt_toolkit', 'HTMLParser', 'wx.grid', 'wx._grid',
                             'wx.lib.agw.genericmessagedialog', 'wx.lib.wordwrap', 'wx.lib.buttons',
                             'wx.lib.embeddedimage', 'wx.lib.imageutils', 'wx.lib.agw.aquabutton', 
-                            'wx.lib.agw.gradientbutton', 'FileDialog', 'Dialog', 'UserList', 'UserString',
-                            'pkg_resources.py2_warn'] + collect_submodules('pymavlink'),
+                            'wx.lib.agw.gradientbutton', 'FileDialog', 'Dialog',
+                            ] + collect_submodules('pymavlink'),
              datas= [ ('tools\\graphs\\*.*', 'MAVProxy\\tools\\graphs' ) ],
              hookspath=None,
              runtime_hooks=None,
+             excludes= ['sphinx', 'docutils', 'alabaster', 'FixTk', 'tcl', 'tk', 'Tkinter'])
+MAVPicViewerAny = Analysis(['.\\tools\\mavpicviewer\\mavpicviewer.py'],
+             pathex=[os.path.abspath('.')],
+             # for some unknown reason these hidden imports don't pull in
+             # all the needed pieces, so we also import them in mavproxy.py
+             hiddenimports=['cv2', 'wx', 
+                            'numpy', 'dateutil', 
+                            'wx.lib.agw.genericmessagedialog', 'wx.lib.wordwrap', 'wx.lib.buttons',
+                            'wx.lib.embeddedimage', 'wx.lib.imageutils', 'wx.lib.agw.aquabutton', 
+                            'wx.lib.agw.gradientbutton', 'FileDialog', 'Dialog',
+                            ] + collect_submodules('pymavlink'),
+             datas= [],
+             hookspath=None,
+             runtime_hooks=None,
              excludes= ['sphinx', 'docutils', 'alabaster', 'FixTk', 'tcl', 'tk', '_tkinter', 'tkinter', 'Tkinter'])
-# MERGE( (MAVProxyAny, 'mavproxy', 'mavproxy'), (MAVExpAny, 'MAVExplorer', 'MAVExplorer') )
+# MERGE( (MAVProxyAny, 'mavproxy', 'mavproxy'), (MAVExpAny, 'MAVExplorer', 'MAVExplorer'), (MAVPicViewerAny, 'mavpicviewer', 'mavpicviewer') )
 MAVProxy_pyz = PYZ(MAVProxyAny.pure)
 MAVProxy_exe = EXE(MAVProxy_pyz,
           MAVProxyAny.scripts,
@@ -69,3 +85,20 @@ MAVExp_coll = COLLECT(MAVExp_exe,
                strip=None,
                upx=True,
                name='MAVExplorer')
+
+MAVPicViewer_pyz = PYZ(MAVPicViewerAny.pure)
+MAVPicViewer_exe = EXE(MAVPicViewer_pyz,
+            MAVPicViewerAny.scripts,
+            exclude_binaries=True,
+            name='mavpicviewer.exe',
+            debug=False,
+            strip=None,
+            upx=True,
+            console=True )
+MAVPicViewer_coll = COLLECT(MAVPicViewer_exe,
+               MAVPicViewerAny.binaries,
+               MAVPicViewerAny.zipfiles,
+               MAVPicViewerAny.datas,
+               strip=None,
+               upx=True,
+               name='mavpicviewer')

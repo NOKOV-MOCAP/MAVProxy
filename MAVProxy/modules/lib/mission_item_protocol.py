@@ -1,13 +1,16 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 '''
 base class for modules generally transfering items using the MISSION_ITEM protocol
+
+AP_FLAKE8_CLEAN
 '''
 
 import copy
 import os
 import re
 import struct
+import sys
 import time
 
 from pymavlink import mavutil
@@ -108,7 +111,7 @@ on'''
         command_argument_buckets = {}
         for c in cs:
             value = cs[c]
-            if type(value) == tuple:
+            if isinstance(value, tuple):
                 (function, arguments) = value
                 args_string = " ".join(arguments)
                 if args_string not in command_argument_buckets:
@@ -204,7 +207,7 @@ on'''
         '''append an item to the held item list'''
         if not self.check_have_list():
             return
-        if type(item) == list:
+        if isinstance(item, list):
             for i in item:
                 self.wploader.add(i)
                 self.wploader.expected_count += 1
@@ -245,7 +248,7 @@ on'''
     def mavlink_packet(self, m):
         '''handle an incoming mavlink packet'''
         mtype = m.get_type()
-        if mtype in ['WAYPOINT_COUNT', 'MISSION_COUNT']:
+        if mtype in ['MISSION_COUNT']:
             if getattr(m, 'mission_type', 0) != self.mav_mission_type():
                 return
             if self.wp_op is None:
@@ -261,7 +264,7 @@ on'''
                 self.wploader.expected_count = m.count
                 self.send_wp_requests()
 
-        elif mtype in ['WAYPOINT', 'MISSION_ITEM', 'MISSION_ITEM_INT'] and self.wp_op is not None:
+        elif mtype in ['MISSION_ITEM', 'MISSION_ITEM_INT'] and self.wp_op is not None:
             if m.get_type() == 'MISSION_ITEM_INT':
                 if getattr(m, 'mission_type', 0) != self.mav_mission_type():
                     # this is not a mission item, likely fence
@@ -292,7 +295,7 @@ on'''
             self.wp_requested = {}
             self.wp_received = {}
 
-        elif mtype in ["WAYPOINT_REQUEST", "MISSION_REQUEST"]:
+        elif mtype in frozenset(["MISSION_REQUEST", "MISSION_REQUEST_INT"]):
             self.process_waypoint_request(m, self.master)
 
     def idle_task(self):
@@ -343,6 +346,10 @@ on'''
            MISSION_ITEM_INT to give cm level accuracy
         '''
         if wp.get_type() == 'MISSION_ITEM_INT':
+            if not isinstance(wp.x, int):
+                print("BUG! wp.x is not integer")
+            if not isinstance(wp.y, int):
+                print("BUG! wp.y is not integer")
             return wp
         if self.has_location(wp.command):
             p5 = int(wp.x*1.0e7)
@@ -426,7 +433,12 @@ on'''
         if wp.mission_type != self.mav_mission_type():
             print("Wrong mission type in (%s)" % str(wp))
 
-        self.master.mav.send(wp_send)
+        try:
+            self.master.mav.send(wp_send)
+        except struct.error:
+            # this is often "required argument is not an integer"
+            mavutil.dump_message_verbose(sys.stderr, wp_send)
+            raise
 
         self.loading_waypoint_lasttime = time.time()
 
@@ -556,8 +568,12 @@ on'''
             alt2 = self.module('terrain').ElevationModel.GetElevation(wp.x, wp.y)
             if alt1 is not None and alt2 is not None:
                 wp.z += alt1 - alt2
-        wp.x = lat
-        wp.y = lon
+        if isinstance(wp, mavutil.mavlink.MAVLink_mission_item_int_message):
+            wp.x = int(lat * 1e7)
+            wp.y = int(lon * 1e7)
+        else:
+            wp.x = lat
+            wp.y = lon
 
         wp.target_system    = self.target_system
         wp.target_component = self.target_component
@@ -671,20 +687,15 @@ on'''
             wpend_offset)
         print("Moved %s %u:%u to %f, %f rotation=%.1f" % (self.itemstype(), wpstart, wpend, lat, lon, rotation))
 
-    def cmd_changealt(self, args):
-        '''handle wp change target alt of multiple waypoints'''
+    def change_mission_item_range(self, args, desc, changer, newvalstr):
         if not self.check_have_list():
-            return
-        if len(args) < 2:
-            print("usage: %s changealt WPNUM NEWALT <NUMWP>" % self.command_name())
             return
         idx = int(args[0])
         if not self.good_item_num_to_manipulate(idx):
             print("Invalid %s number %u" % (self.itemtype(), idx))
             return
-        newalt = float(args[1])
-        if len(args) >= 3:
-            count = int(args[2])
+        if len(args) >= 2:
+            count = int(args[1])
         else:
             count = 1
         if not self.good_item_num_to_manipulate(idx+count-1):
@@ -694,23 +705,50 @@ on'''
         for wpnum in range(idx, idx+count):
             offset = self.item_num_to_offset(wpnum)
             wp = self.wploader.wp(offset)
+            if wp is None:
+                continue
             if not self.wploader.is_location_command(wp.command):
                 continue
-            wp.z = newalt
+            changer(wp)
             wp.target_system = self.target_system
             wp.target_component = self.target_component
             self.wploader.set(wp, offset)
 
         self.wploader.last_change = time.time()
+        self.upload_start = time.time()
         self.loading_waypoints = True
         self.loading_waypoint_lasttime = time.time()
         self.master.mav.mission_write_partial_list_send(
             self.target_system,
             self.target_component,
-            offset,
-            offset,
+            self.item_num_to_offset(idx),
+            self.item_num_to_offset(idx+count),
             mission_type=self.mav_mission_type())
-        print("Changed alt for WPs %u:%u to %f" % (idx, idx+(count-1), newalt))
+        print("Changed %s for WPs %u:%u to %s" % (desc, idx, idx+(count-1), newvalstr))
+
+    def cmd_changealt(self, args):
+        '''handle wp change target alt of multiple waypoints'''
+        if len(args) < 2:
+            print("usage: %s changealt WPNUM NEWALT <NUMWP>" % self.command_name())
+            return
+        value = float(args[1])
+        del args[1]
+
+        def changer(wp):
+            wp.z = value
+        self.change_mission_item_range(args, "alt", changer, str(value))
+
+    def cmd_changeframe(self, args):
+        '''handle wp change frame of multiple waypoints'''
+        if len(args) < 2:
+            print("usage: %s changeframe WPNUM NEWFRAME <NUMWP>" % self.command_name())
+            return
+        value = int(args[1])
+        del args[1]
+
+        def changer(wp):
+            wp.frame = value
+        self.change_mission_item_range(args, "frame", changer, str(value))
 
     def fix_jumps(self, idx, delta):
         # nothing by default as only waypoints need worry
@@ -893,7 +931,7 @@ on'''
             return
 
         function = commands[args[0]]
-        if type(function) == tuple:
+        if isinstance(function, tuple):
             (function, function_arguments) = function
             # TODO: do some argument validation here, remove same from
             # cmd_*
@@ -932,7 +970,7 @@ on'''
     def savecsv(self, filename):
         '''save waypoints to a file in human-readable CSV file'''
         f = open(filename, mode='w')
-        headers = ["Seq", "Frame", "Cmd", "P1", "P2", "P3", "P4", "X", "Y", "Z"]
+        # headers = ["Seq", "Frame", "Cmd", "P1", "P2", "P3", "P4", "X", "Y", "Z"]
         for w in self.wploader.wpoints:
             if getattr(w, 'comment', None):
                 #                f.write("# %s\n" % w.comment)
@@ -1091,4 +1129,5 @@ on'''
         else:
             mavmsg = mavutil.mavlink.MAVLink_mission_item_int_message
             item_size = mavmsg.unpacker.size
-            print("Sent %s of length %u in %.2fs" % (self.itemtype(), (dlen - 10) // item_size, time.time() - self.upload_start))
+            print("Sent %s of length %u in %.2fs" %
+                  (self.itemtype(), (dlen - 10) // item_size, time.time() - self.upload_start))

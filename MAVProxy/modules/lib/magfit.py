@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 '''
 fit best estimate of magnetometer offsets, diagonals, off-diagonals, cmot and scaling using WMM target
@@ -7,7 +7,7 @@ fit best estimate of magnetometer offsets, diagonals, off-diagonals, cmot and sc
 from MAVProxy.modules.lib import wx_processguard
 from MAVProxy.modules.lib.wx_loader import wx
 
-import sys, time, os, math, copy
+import sys, time, os, math, copy, platform
 
 from pymavlink import mavutil
 from pymavlink import mavextra
@@ -18,6 +18,8 @@ from MAVProxy.modules.lib import grapher
 from MAVProxy.modules.lib.multiproc_util import MPDataLogChildTask
 
 import matplotlib
+if platform.system() == "Windows":
+    matplotlib.use('wxagg')
 import matplotlib.pyplot as pyplot
 import numpy
 import datetime
@@ -577,6 +579,8 @@ class MagFitUI(wx.Dialog):
             att_choices.append('XKF1')
         if self.have_msg('XKY0'):
             att_choices.append('XKY0')
+        if self.have_msg('DCM'):
+            att_choices.append('DCM')
 
         orientation_choices = [ r.name for r in rotations ]
 

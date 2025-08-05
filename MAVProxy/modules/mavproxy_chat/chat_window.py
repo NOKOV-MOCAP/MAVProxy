@@ -18,7 +18,8 @@ class chat_window():
         self.mpstate = mpstate
 
         # create chat_openai object
-        self.chat_openai = chat_openai.chat_openai(self.mpstate, self.set_status_text, wait_for_command_ack_fn)
+        self.chat_openai = chat_openai.chat_openai(self.mpstate, self.set_status_text, self.append_chat_replies,
+                                                   wait_for_command_ack_fn)
 
         # create chat_voice_to_text object
         self.chat_voice_to_text = chat_voice_to_text.chat_voice_to_text()
@@ -38,7 +39,8 @@ class chat_window():
 
         # add api key input window
         self.apikey_frame = wx.Frame(None, title="Input OpenAI API Key", size=(560, 50))
-        self.apikey_text_input = wx.TextCtrl(self.apikey_frame, id=-1, pos=(10, 10), size=(450, -1), style=wx.TE_PROCESS_ENTER)
+        self.apikey_text_input = wx.TextCtrl(self.apikey_frame, id=-1, pos=(10, 10), size=(450, -1),
+                                             style=wx.TE_PASSWORD | wx.TE_PROCESS_ENTER)
         self.apikey_set_button = wx.Button(self.apikey_frame, id=-1, label="Set", pos=(470, 10), size=(75, 25))
         self.apikey_frame.Bind(wx.EVT_BUTTON, self.apikey_set_button_click, self.apikey_set_button)
         self.apikey_frame.Bind(wx.EVT_TEXT_ENTER, self.apikey_set_button_click, self.apikey_text_input)
@@ -56,7 +58,8 @@ class chat_window():
 
         # add a record button
         self.record_button = wx.Button(self.frame, id=-1, label="Rec", size=(75, 25))
-        self.frame.Bind(wx.EVT_BUTTON, self.record_button_click, self.record_button)
+        self.record_button.Bind(wx.EVT_LEFT_DOWN, self.record_button_pushed, self.record_button)
+        self.record_button.Bind(wx.EVT_LEFT_UP, self.record_button_released, self.record_button)
         self.horiz_sizer.Add(self.record_button, proportion=0, flag=wx.ALIGN_TOP | wx.ALL, border=5)
 
         # add an input text box
@@ -68,6 +71,12 @@ class chat_window():
         self.send_button = wx.Button(self.frame, id=-1, label="Send", size=(75, 25))
         self.frame.Bind(wx.EVT_BUTTON, self.send_button_click, self.send_button)
         self.horiz_sizer.Add(self.send_button, proportion=0, flag=wx.ALIGN_TOP | wx.ALL, border=5)
+
+        # add a cancel button
+        self.cancel_button = wx.Button(self.frame, id=-1, label="cancel", size=(75, 25))
+        self.frame.Bind(wx.EVT_BUTTON, self.cancel_button_click , self.cancel_button)
+        self.horiz_sizer.Add(self.cancel_button, proportion=0, flag=wx.ALIGN_TOP | wx.ALL, border=5)
+        wx.CallAfter(self.cancel_button.Disable)
 
         # set size hints and add sizer to frame
         self.vert_sizer.Add(self.text_reply, proportion=1, flag=wx.EXPAND, border=5)
@@ -112,12 +121,6 @@ class chat_window():
         self.apikey_frame.Hide()
 
     # record button clicked
-    def record_button_click(self, event):
-        # run record_button_click_execute in a new thread
-        th = Thread(target=self.record_button_click_execute, args=(event,))
-        th.start()
-
-    # record button clicked
     def record_button_click_execute(self, event):
         # record audio
         self.set_status_text("recording audio")
@@ -137,6 +140,22 @@ class chat_window():
         # send text to assistant
         self.set_status_text("sending text to assistasnt")
         self.send_text_to_assistant()
+
+    # record button pushed
+    def record_button_pushed(self, event):
+        # run record_button_click_execute in a new thread
+        th = Thread(target=self.record_button_click_execute, args=(event,))
+        th.start()
+
+    # record button released
+    def record_button_released(self, event):
+        # Run when mouse click is released
+        # set the stop_recording status to True
+        chat_voice_to_text.stop_recording[0] = True
+
+    # cancel button clicked
+    def cancel_button_click(self, event):
+        self.chat_openai.cancel_run()
 
     # send button clicked
     def send_button_click(self, event):
@@ -160,6 +179,8 @@ class chat_window():
             focus = self.text_input
 
         # disable buttons and text input to stop multiple inputs (can't be done from a thread or must use CallAfter)
+        # enable the cancel button to cancel the current run
+        wx.CallAfter(self.cancel_button.Enable)
         wx.CallAfter(self.record_button.Disable)
         wx.CallAfter(self.text_input.Disable)
         wx.CallAfter(self.send_button.Disable)
@@ -169,17 +190,15 @@ class chat_window():
         wx.CallAfter(self.text_input.Clear)
 
         # copy user input text to reply box
-        orig_text_attr = self.text_reply.GetDefaultStyle()
         wx.CallAfter(self.text_reply.SetDefaultStyle, wx.TextAttr(wx.RED))
-        wx.CallAfter(self.text_reply.AppendText, send_text + "\n")
+        wx.CallAfter(self.text_reply.AppendText, "\n" + send_text + "\n")
 
-        # send text to assistant and place reply in reply box
-        reply = self.chat_openai.send_to_assistant(send_text)
-        if reply:
-            wx.CallAfter(self.text_reply.SetDefaultStyle, orig_text_attr)
-            wx.CallAfter(self.text_reply.AppendText, reply + "\n\n")
+        # send text to assistant. replies will be handled by append_chat_replies
+        self.chat_openai.send_to_assistant(send_text)
 
         # reenable buttons and text input (can't be done from a thread or must use CallAfter)
+        # disable the cancel button
+        wx.CallAfter(self.cancel_button.Disable)
         wx.CallAfter(self.record_button.Enable)
         wx.CallAfter(self.text_input.Enable)
         wx.CallAfter(self.send_button.Enable)
@@ -191,3 +210,8 @@ class chat_window():
     # set status text
     def set_status_text(self, text):
         wx.CallAfter(self.text_status.SetValue, text)
+
+    # append chat to reply box
+    def append_chat_replies(self, text):
+        wx.CallAfter(self.text_reply.SetDefaultStyle, wx.TextAttr(wx.BLACK))
+        wx.CallAfter(self.text_reply.AppendText, text)

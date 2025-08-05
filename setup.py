@@ -1,7 +1,7 @@
 from setuptools import setup
 import os, platform, sys
 
-version = "1.8.70"
+version = "1.8.74"
 
 def package_files(directory):
     paths = []
@@ -42,8 +42,9 @@ if platform.system() == "Darwin":
                          'wxPython'])
 
 if platform.system() == "Windows" and sys.version_info >= (3, 0):
-    # on MacOS we can have a more complete requirements list
+    # on Windows we can have a more complete requirements list
     requirements.extend(['prompt_toolkit'])
+    requirements.append('requests')
 elif platform.system() == "Windows":
     requirements.extend(['pyreadline'])
 
@@ -76,6 +77,7 @@ on how to use MAVProxy.''',
       license='GPLv3',
       packages=['MAVProxy',
                 'MAVProxy.modules',
+                'MAVProxy.modules.mavproxy_anufireproject',
                 'MAVProxy.modules.mavproxy_fieldcheck',
                 'MAVProxy.modules.mavproxy_map',
                 'MAVProxy.modules.mavproxy_mmap',
@@ -95,12 +97,17 @@ on how to use MAVProxy.''',
                 'MAVProxy.modules.lib.optparse_gui'],
       install_requires=requirements,
       extras_require={
+        'cesium': ['tornado'],
         # restserver module
         'server': ['flask'],
+        'recommended': ['flask', 'PyYAML', 'lxml', 'wxpython',
+                        'pymonocypher', 'openai', 'paho-mqtt',
+                        'piexif', 'pynmea2', 'Pygame', 'Pillow']
       },
       scripts=['MAVProxy/mavproxy.py',
                'MAVProxy/tools/mavflightview.py',
                'MAVProxy/tools/MAVExplorer.py',
+               'MAVProxy/tools/mavpicviewer/mavpicviewer.py',
                'MAVProxy/modules/mavproxy_map/mp_slipmap.py',
                'MAVProxy/modules/mavproxy_map/mp_tile.py'],
       package_data={'MAVProxy':

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 
 from __future__ import print_function
 
@@ -30,6 +30,7 @@ from MAVProxy.modules.lib.mp_menu import *
 import MAVProxy.modules.lib.mp_util as mp_util
 from pymavlink import mavutil
 from pymavlink import mavwp
+from pymavlink import DFReader
 from MAVProxy.modules.lib.mp_settings import MPSettings, MPSetting
 from MAVProxy.modules.lib import wxsettings
 from MAVProxy.modules.lib.graphdefinition import GraphDefinition
@@ -114,6 +115,7 @@ class MEState(object):
               MPSetting('debug', int, 0, 'debug level'),
               MPSetting('paramdocs', bool, True, 'show param docs'),
               MPSetting('max_rate', float, 0, 'maximum display rate of graphs in Hz'),
+              MPSetting('vehicle_type', str, 'Auto', 'force vehicle type for mode handling'),
               ]
             )
 
@@ -127,7 +129,8 @@ class MEState(object):
             "graph"     : ['(VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE)'],
             "dump"      : ['(MESSAGETYPE)', '--verbose (MESSAGETYPE)'],
             "map"       : ['(VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE) (VARIABLE)'],
-            "param"     : ['download', 'check', 'help (PARAMETER)'],
+            "param"     : ['download', 'check', 'help (PARAMETER)', 'save', 'savechanged', 'diff', 'show', 'check'],
+            "logmessage": ['download', 'help (MESSAGETYPE)'],
             }
         self.aliases = {}
         self.graphs = []
@@ -332,6 +335,9 @@ def load_graphs():
     mestate.graphs = []
     gfiles = ['mavgraphs.xml']
     for dirname, dirnames, filenames in os.walk(mp_util.dot_mavproxy()):
+        # Skip XML files in the LogMessages subfolder
+        if os.path.basename(dirname) == "LogMessages":
+            continue
         for filename in filenames:
             if filename.lower().endswith('.xml'):
                 gfiles.append(os.path.join(dirname, filename))
@@ -341,7 +347,8 @@ def load_graphs():
             continue
         # skip parameter files.  They specify an encoding, and under
         # Python3 this leads to a warning from etree
-        if os.path.basename(file) in ["ArduSub.xml", "ArduPlane.xml", "APMrover2.xml", "ArduCopter.xml", "AntennaTracker.xml", "Blimp.xml", "Rover.xml"]:
+        if os.path.basename(file) in ["ArduSub.xml", "ArduPlane.xml", "APMrover2.xml", "ArduCopter.xml",
+                                      "AntennaTracker.xml", "Blimp.xml", "Rover.xml", "Heli.xml"]:
             continue
         graphs = load_graph_xml(open(file).read(), file)
         if graphs:
@@ -380,12 +387,38 @@ def flightmode_colours():
                 idx = 0
     return mapping
 
+def check_vehicle_type():
+    '''check vehicle_type option'''
+    vtypes = { "Rover" : mavutil.mavlink.MAV_TYPE_GROUND_ROVER,
+               "Plane" : mavutil.mavlink.MAV_TYPE_FIXED_WING,
+               "Copter" : mavutil.mavlink.MAV_TYPE_QUADROTOR,
+               "Tracker" : mavutil.mavlink.MAV_TYPE_ANTENNA_TRACKER,
+               "Antenna" : mavutil.mavlink.MAV_TYPE_ANTENNA_TRACKER,
+               "Sub" : mavutil.mavlink.MAV_TYPE_SUBMARINE,
+               "Blimp" : mavutil.mavlink.MAV_TYPE_AIRSHIP
+    }
+    if mestate.settings.vehicle_type == 'Auto':
+        # let mavutil handle it
+        return
+    old_mav_type = mestate.mlog.mav_type
+    for k in vtypes.keys():
+        if mestate.settings.vehicle_type.lower().find(k.lower()) != -1:
+            mestate.mlog.mav_type = vtypes[k]
+            if old_mav_type != mestate.mlog.mav_type:
+                global flightmodes
+                mestate.mlog._flightmodes = None
+                flightmodes = mestate.mlog.flightmode_list()
+            return
+    print("Unknown vehicle type '%s'" % mestate.settings.vehicle_type)
+
+
 def cmd_graph(args):
     '''graph command'''
     usage = "usage: graph <FIELD...>"
     if len(args) < 1:
         print(usage)
         return
+    check_vehicle_type()
     if args[0][0] == ':':
         i = int(args[0][1:])
         g = mestate.graphs[i]
@@ -415,17 +448,28 @@ def cmd_map(args):
     import mavflightview
     #mestate.mlog.reduce_by_flightmodes(mestate.flightmode_selections)
     #setup and process the map
+    check_vehicle_type()
     options = mavflightview.mavflightview_options()
     options.condition = mestate.settings.condition
     options._flightmodes = mestate.mlog._flightmodes
     options.show_flightmode_legend = mestate.settings.show_flightmode
     options.colour_source='flightmode'
-    options.nkf_sample = 1
+
+    # check for kml or kmz
+    for a in args:
+        if a.endswith('.kml') or a.endswith('.kmz'):
+            options.kml = a
+            args = list(filter(lambda x : x != a, args))
+            break
     if len(args) > 0:
-        options.types = ','.join(args)
-        if len(options.types) > 1:
+        options.types = ':'.join(args)
+        filtered_args = list(filter(lambda x : x != "CMD", options.types))
+        if len(filtered_args) > 1:
             options.colour_source='type'
-    [path, wp, fen, used_flightmodes, mav_type, instances] = mavflightview.mavflightview_mav(mestate.mlog, options, mestate.flightmode_selections)
+    mfv_mav_ret = mavflightview.mavflightview_mav(mestate.mlog, options, mestate.flightmode_selections)
+    if mfv_mav_ret is None:
+        return
+    [path, wp, fen, used_flightmodes, mav_type, instances] = mfv_mav_ret
     global map_timelim_pipes
     timelim_pipe = multiproc.Pipe()
     child = multiproc.Process(target=mavflightview.mavflightview_show, args=[path, wp, fen, used_flightmodes, mav_type, options, instances, None, timelim_pipe])
@@ -689,9 +733,13 @@ events = {
     73 : "DATA_LAND_REPO_ACTIVE",
     74 : "DATA_STANDBY_ENABLE",
     75 : "DATA_STANDBY_DISABLE",
+    76 : "FENCE_ALT_MAX_ENABLE",
+    77 : "FENCE_ALT_MAX_DISABLE",
 
     80 : "FENCE_FLOOR_ENABLE",
     81 : "FENCE_FLOOR_DISABLE",
+    82 : "FENCE_POLYGON_ENABLE",
+    83 : "FENCE_POLYGON_DISABLE",
 
     85 : "EK3_SOURCES_SET_TO_PRIMARY",
     86 : "EK3_SOURCES_SET_TO_SECONDARY",
@@ -1130,7 +1178,7 @@ def cmd_param(args):
             verbose = True
     else:
         wildcard = '*'
-    k = sorted(mlog.params.keys())
+    k = mp_util.sorted_natural(mlog.params.keys())
     for p in k:
         if fnmatch.fnmatch(str(p).upper(), wildcard.upper()):
             s = "%-16.16s %f" % (str(p), mlog.params[p])
@@ -1175,6 +1223,44 @@ def cmd_paramchange(args):
         print("%s %s %.6f -> %.6f" % (timestring(m), pname, vmap[pname], pvalue))
         vmap[pname] = pvalue
     mestate.mlog.rewind()
+
+
+def cmd_logmessage(args):
+    '''show log message information'''
+    mlog = mestate.mlog
+    usage = "Usage: logmessage <help|download>"
+    # Print usage and return, if we have no arguments
+    if len(args) <= 0:
+        print(usage)
+        return
+    # help: print help for the requested log message
+    if args[0] == 'help':
+        if len(args) < 2:
+            print(usage)
+            return
+        if hasattr(mlog, 'metadata'):
+            mlog.metadata.print_help(args[1])
+        elif isinstance(mlog, mavutil.mavlogfile):
+            print("logmessage help is not supported for telemetry log files")
+        else:
+            print("Incompatible pymavlink; upgrade pymavlink?")
+        return
+    # download: download XML files for log messages
+    if args[0] == 'download':
+        if not hasattr(DFReader, 'DFMetaData'):
+            print("Incompatible pymavlink; upgrade pymavlink?")
+            return
+        try:
+            child = multiproc.Process(target=DFReader.DFMetaData.download)
+            child.start()
+        except Exception as e:
+            print(e)
+        if hasattr(mlog, 'metadata'):
+            mlog.metadata.reset()
+        return
+    # Print usage if we've dropped through the ifs
+    print(usage)
+
 
 def cmd_mission(args):
     '''show mission'''
@@ -1246,7 +1332,7 @@ def cmd_devid(args):
         if p.startswith('COMPASS_DEV_ID') or p.startswith('COMPASS_PRIO') or (
                 p.startswith('COMPASS') and p.endswith('DEV_ID')):
             mp_util.decode_devid(params[p], p)
-        if p.startswith('INS_') and p.endswith('_ID'):
+        if p.startswith('INS') and p.endswith('_ID'):
             mp_util.decode_devid(params[p], p)
         if p.startswith('GND_BARO') and p.endswith('_ID'):
             mp_util.decode_devid(params[p], p)
@@ -1463,6 +1549,7 @@ command_map = {
     'dump'       : (cmd_dump,      'dump messages from log'),
     'file'       : (cmd_file,      'show files'),
     'mission'    : (cmd_mission,   'show mission'),
+    'logmessage' : (cmd_logmessage, 'show log message information'),
     }
 
 def progress_bar(pct):

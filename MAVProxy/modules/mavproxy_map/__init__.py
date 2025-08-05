@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 '''
 map display module
 Andrew Tridgell
@@ -8,11 +8,13 @@ June 2012
 import sys, os, math
 import functools
 import time
+import datetime
 from MAVProxy.modules.lib import mp_util
 from MAVProxy.modules.lib import mp_settings
 from MAVProxy.modules.lib import mp_module
 from MAVProxy.modules.lib.mp_menu import *
 from pymavlink import mavutil
+from PIL import ImageColor
 
 class MapModule(mp_module.MPModule):
     def __init__(self, mpstate):
@@ -25,6 +27,7 @@ class MapModule(mp_module.MPModule):
         self.wp_change_time = 0
         self.fence_change_time = 0
         self.rally_change_time = 0
+        self.terrain_contour_ids = []
         self.have_simstate = False
         self.have_vehicle = {}
         self.move_wp = -1
@@ -59,9 +62,15 @@ class MapModule(mp_module.MPModule):
               ('loitercircle',bool, False),
               ('showclicktime',int, 2),
               ('showwpnum',bool, True),
+              ('circle_linewidth', int, 1),
               ('showdirection', bool, False),
               ('setpos_accuracy', float, 50),
-              ('font_size', float, 0.5) ])
+              ('mission_color', str, "white"),
+              ('font_size', float, 0.5),
+              ('contour_levels', int, 20),
+              ('contour_grid_spacing', float, 30.0),
+              ('contour_grid_extent', float, 20000.0),
+            ])
         
         service='MicrosoftHyb'
         if 'MAP_SERVICE' in os.environ:
@@ -87,21 +96,32 @@ class MapModule(mp_module.MPModule):
                                                                 'zoom',
                                                                 'center',
                                                                 'follow',
+                                                                'menu',
+                                                                'marker',
                                                                 'clear'])
         self.add_completion_function('(MAPSETTING)', self.map_settings.completion)
 
         self.default_popup = MPMenuSubMenu('Popup', items=[])
         self.add_menu(MPMenuItem('Fly To', 'Fly To', '# guided ',
-                                 handler=MPMenuCallTextDialog(title='Altitude (m)', default=self.mpstate.settings.guidedalt)))
-        self.add_menu(MPMenuItem('Set Home', 'Set Home', '# confirm "Set HOME?" map sethomepos '))
-        self.add_menu(MPMenuItem('Set Home (with height)', 'Set Home', '# confirm "Set HOME with height?" map sethome '))
-        self.add_menu(MPMenuItem('Set Origin', 'Set Origin', '# confirm "Set ORIGIN?" map setoriginpos '))
-        self.add_menu(MPMenuItem('Set Origin (with height)', 'Set Origin', '# confirm "Set ORIGIN with height?" map setorigin '))
+                                 handler=MPMenuCallTextDropdownDialog(title='Altitude', default=self.mpstate.settings.guidedalt,
+                                                                      dropdown_label='Frame',
+                                                                      dropdown_options=['AboveHome','AGL','AMSL'],
+                                                                      default_dropdown=self.settings.flytoframe)))
         self.add_menu(MPMenuItem('Terrain Check', 'Terrain Check', '# terrain check'))
         self.add_menu(MPMenuItem('Show Position', 'Show Position', 'showPosition'))
         self.add_menu(MPMenuItem('Google Maps Link', 'Google Maps Link', 'printGoogleMapsLink'))
         self.add_menu(MPMenuItem('Set ROI', 'Set ROI', '# map setroi '))
         self.add_menu(MPMenuItem('Set Position', 'Set Position', '# map setposition '))
+        self.add_menu(MPMenuSubMenu('Home', items=[
+            MPMenuItem('Set Home', 'Set Home', '# confirm "Set HOME?" map sethomepos '),
+            MPMenuItem('Set Home (with height)', 'Set Home', '# confirm "Set HOME with height?" map sethome '),
+            MPMenuItem('Set Origin', 'Set Origin', '# confirm "Set ORIGIN?" map setoriginpos '),
+            MPMenuItem('Set Origin (with height)', 'Set Origin', '# confirm "Set ORIGIN with height?" map setorigin '),
+        ]))
+
+        self.cmd_menu_add(["Marker:Flag", "map", "marker", "flag"])
+        self.cmd_menu_add(["Marker:Barrell", "map", "marker", "barrell"])
+        self.cmd_menu_add(["Marker:Flame", "map", "marker", "flame"])
 
         self._colour_for_wp_command = {
             # takeoff commands
@@ -128,12 +148,37 @@ class MapModule(mp_module.MPModule):
             mavutil.mavlink.MAV_CMD_NAV_VTOL_LAND: "VL",
         }
 
+        self.add_menu(MPMenuSubMenu('Terrain', items=[
+            MPMenuItem('Show Contours', returnkey='showTerrainContours'),
+            MPMenuItem('Hide Contours', returnkey='hideTerrainContours'),
+            MPMenuItem('Remove Contours', returnkey='removeTerrainContours'),
+        ]))
+
     def add_menu(self, menu):
         '''add to the default popup menu'''
         from MAVProxy.modules.mavproxy_map import mp_slipmap
         self.default_popup.add(menu)
         self.map.add_object(mp_slipmap.SlipDefaultPopup(self.default_popup, combine=True))
 
+    def cmd_menu_add(self, args):
+        '''add to map menus'''
+        if len(args) < 2:
+            print("Usage: map menu add MenuPath command")
+            return
+        menupath = args[0].strip('"').split(':')
+        name = menupath[-1]
+        cmd = '# ' + ' '.join(args[1:])
+        self.default_popup.add_to_submenu(menupath[:-1], MPMenuItem(name, name, cmd))
+        self.map.add_object(mp_slipmap.SlipDefaultPopup(self.default_popup, combine=True))
+
+    def cmd_menu(self, args):
+        '''control console menus'''
+        if len(args) < 2:
+            print("Usage: map menu <add>")
+            return
+        if args[0] == 'add':
+            self.cmd_menu_add(args[1:])
+        
     def remove_menu(self, menu):
         '''add to the default popup menu'''
         from MAVProxy.modules.mavproxy_map import mp_slipmap
@@ -160,11 +205,88 @@ class MapModule(mp_module.MPModule):
         pos = self.mpstate.click_location
         print("https://www.google.com/maps/search/?api=1&query=%f,%f" % (pos[0], pos[1]))
 
+    def write_JSON(self, fname, template, vardict):
+        '''write a JSON file in log directory'''
+        fname = os.path.join(self.logdir, fname)
+        json = template
+        for k in vardict.keys():
+            value = vardict[k]
+            json = json.replace("{{" + k + "}}", str(value))
+        open(fname, 'w').write(json)
+
+    def cmd_map_marker(self, args, latlon=None):
+        '''add a map marker'''
+        usage = "Usage: map marker <icon>"
+        if latlon is None:
+            latlon = self.mpstate.click_location
+        if latlon is None:
+            print("Need click position for marker")
+            return
+        (lat, lon) = latlon
+        marker = 'flag'
+        text = ''
+        if len(args) > 0:
+            marker = args[0]
+
+        if len(args) > 1:
+            text = ' '.join(args[1:])
+        flag = marker + '.png'
+
+        icon = self.map.icon(flag)
+        self.map.add_object(mp_slipmap.SlipIcon(
+            'icon - %s [%u]' % (str(flag),self.icon_counter),
+            (float(lat),float(lon)),
+            icon, layer=3, rotation=0, follow=False))
+        self.icon_counter += 1
+        now = time.time()
+        tstr = datetime.datetime.fromtimestamp(now).strftime("%Y_%m_%d_%H_%M_%S")
+        subsec = now - math.floor(now)
+        millis = int(subsec * 1000)
+        fname = "marker_%s_%03u.json" % (tstr, millis)
+
+        gpi = self.master.messages.get('GLOBAL_POSITION_INT',None)
+        att = self.master.messages.get('ATTITUDE',None)
+
+        self.write_JSON(fname,'''{
+"marker" : {{MARKER}},
+"text" : "{{TEXT}}",
+"tsec" : {{TIMESEC}},
+"mlat" : {{LAT}},
+"mlon" : {{LON}},
+"vlat" : {{VLAT}},
+"vlon" : {{VLON}},
+"valt" : {{VALT}},
+"gspeed" : {{GSPEED}},
+"ghead" : {{GHEAD}},
+"roll" : {{ROLL}},
+"pitch" : {{PITCH}},
+"yaw" : {{YAW}},
+}
+''', {
+    "TIMESEC" : now,
+    "MARKER" : marker,
+    "TEXT" : text,
+    "LAT" : lat,
+    "LON" : lon,
+    "VLAT" : "%.9f" % (gpi.lat*1.0e-7),
+    "VLON" : "%.9f" % (gpi.lon*1.0e-7),
+    "VALT" : gpi.alt*1.0e-3,
+    "GSPEED" : math.sqrt(gpi.vx**2+gpi.vy**2)*0.01,
+    "GHEAD" : gpi.hdg*0.01,
+    "ROLL" : math.degrees(att.roll),
+    "PITCH" : math.degrees(att.pitch),
+    "YAW" : math.degrees(att.yaw)
+    })
+
+        print("Wrote marker %s" % fname)
+
     def cmd_map(self, args):
         '''map commands'''
         from MAVProxy.modules.mavproxy_map import mp_slipmap
         if len(args) < 1:
-            print("usage: map <icon|set>")
+            print("usage: map <icon|set|menu|marker>")
+        elif args[0] == "menu":
+            self.cmd_menu(args[1:])
         elif args[0] == "icon":
             usage = "Usage: map icon <lat> <lon> <icon>"
             flag = 'flag.png'
@@ -191,6 +313,8 @@ class MapModule(mp_module.MPModule):
                 icon, layer=3, rotation=0, follow=False))
             self.icon_counter += 1
 
+        elif args[0] == "marker":
+            self.cmd_map_marker(args[1:])
         elif args[0] == "vehicletype":
             if len(args) < 3:
                 print("Usage: map vehicletype SYSID TYPE")
@@ -200,34 +324,7 @@ class MapModule(mp_module.MPModule):
                 self.vehicle_type_override[sysid] = vtype
                 print("Set sysid %u to vehicle type %u" % (sysid, vtype))
         elif args[0] == "circle":
-            if len(args) < 4:
-                # map circle -27.70533373 153.23404844 5 red
-                print("Usage: map circle <lat> <lon> <radius> <colour>")
-            else:
-                lat = args[1]
-                lon = args[2]
-                radius = args[3]
-                colour = 'red'
-                if len(args) > 4:
-                    colour = args[4]
-                if colour == "red":
-                    colour = (255,0,0)
-                elif colour == "green":
-                    colour = (0,255,0)
-                elif colour == "blue":
-                    colour = (0,0,255)
-                else:
-                    colour = eval(colour)
-                circle = mp_slipmap.SlipCircle(
-                    "circle %u" % self.circle_counter,
-                    3,
-                    (float(lat), float(lon)),
-                    float(radius),
-                    colour,
-                    linewidth=1,
-                )
-                self.map.add_object(circle)
-                self.circle_counter += 1
+            self.cmd_map_circle(args[1:])
         elif args[0] == "set":
             self.map_settings.command(args[1:])
             self.map.add_object(mp_slipmap.SlipBrightness(self.map_settings.brightness))
@@ -253,6 +350,64 @@ class MapModule(mp_module.MPModule):
             self.cmd_set_position(args)
         else:
             print("usage: map <icon|set>")
+
+    def cmd_map_circle(self, args):
+        usage = '''
+Usage: map circle <lat> <lon> <radius> <colour>
+Usage: map circle <radius> <colour>
+        '''
+
+        lat = None
+        colour = None
+        # syntax 1, lat/lon/radius/colour
+        if len(args) == 4:
+            colour = args[3]
+            args = args[0:3]
+        if len(args) == 3:
+            lat = args[0]
+            lon = args[1]
+            radius = args[2]
+
+        # syntax 2, radius/colour, uses click position
+        if len(args) == 2:
+            colour = args[1]
+            args = args[0:1]
+        if len(args) == 1:
+            pos = self.mpstate.click_location
+            if pos is None:
+                print("Need click or location")
+                print(usage)
+                return
+
+            (lat, lon) = pos
+            radius = args[0]
+
+        if lat is None:
+            print(usage)
+            return
+
+        if colour is None:
+            colour = "red"
+
+        if colour == "red":
+            colour = (255,0,0)
+        elif colour == "green":
+            colour = (0,255,0)
+        elif colour == "blue":
+            colour = (0,0,255)
+        else:
+            colour = eval(colour)
+
+        circle = mp_slipmap.SlipCircle(
+            "circle %u" % self.circle_counter,
+            3,
+            (float(lat), float(lon)),
+            float(radius),
+            colour,
+            linewidth=self.map_settings.circle_linewidth,
+        )
+        self.map.add_object(circle)
+        self.circle_counter += 1
 
     def colour_for_wp(self, wp_num):
         '''return a tuple describing the colour a waypoint should appear on the map'''
@@ -284,7 +439,7 @@ class MapModule(mp_module.MPModule):
             if len(p) > 1:
                 popup = MPMenuSubMenu('Popup', items)
                 self.map.add_object(mp_slipmap.SlipPolygon('mission %u' % i, p,
-                                                                   layer='Mission', linewidth=2, colour=(255,255,255),
+                                                                   layer='Mission', linewidth=2, colour=ImageColor.getrgb(self.map_settings.mission_color),
                                                                    arrow = self.map_settings.showdirection, popup_menu=popup))
         labeled_wps = {}
         self.map.add_object(mp_slipmap.SlipClearLayer('LoiterCircles'))
@@ -505,7 +660,6 @@ class MapModule(mp_module.MPModule):
         else:
             self.map.remove_object('Fence')
 
-
     def closest_waypoint(self, latlon):
         '''find closest waypoint to a position'''
         (lat, lon) = latlon
@@ -633,6 +787,12 @@ class MapModule(mp_module.MPModule):
             self.print_google_maps_link()
         elif menuitem.returnkey == 'setServiceTerrain':
             self.module('terrain').cmd_terrain(['set', 'source', menuitem.get_choice()])
+        elif menuitem.returnkey == 'showTerrainContours':
+            self.display_terrain_contours()
+        elif menuitem.returnkey == 'hideTerrainContours':
+            self.hide_terrain_contours()
+        elif menuitem.returnkey == 'removeTerrainContours':
+            self.remove_terrain_contours()
 
     def map_callback(self, obj):
         '''called when an event happens on the slipmap'''
@@ -736,6 +896,9 @@ class MapModule(mp_module.MPModule):
             if not self.map.is_alive():
                 self.needs_unloading = True
 
+        # check for any events from the map
+        self.map.check_events()
+
     def create_vehicle_icon(self, name, colour, follow=False, vehicle_type=None):
         '''add a vehicle to the map'''
         from MAVProxy.modules.mavproxy_map import mp_slipmap
@@ -747,6 +910,15 @@ class MapModule(mp_module.MPModule):
         icon = self.map.icon(colour + vehicle_type + '.png')
         self.map.add_object(mp_slipmap.SlipIcon(name, (0,0), icon, layer=3, rotation=0, follow=follow,
                                                    trail=mp_slipmap.SlipTrail()))
+
+    def remove_vehicle_icon(self, name, vehicle_type=None):
+        from MAVProxy.modules.mavproxy_map import mp_slipmap
+        if vehicle_type is None:
+            vehicle_type = self.vehicle_type_name
+        if name not in self.have_vehicle or self.have_vehicle[name] != vehicle_type:
+            return
+        del self.have_vehicle[name]
+        self.map.remove_object(name)
 
     def drawing_update(self):
         '''update line drawing'''
@@ -916,6 +1088,31 @@ class MapModule(mp_module.MPModule):
         self.create_vehicle_icon('VehiclePos2', 'blue', follow=False, vehicle_type='plane')
         self.map.set_position('VehiclePos2', (lat, lon), rotation=heading, label=agl_s, colour=(0,255,255))
 
+    def update_vehicle_icon(self, name, vehicle, colour, m, display):
+        '''update display of a vehicle on the map.  m is expected to store
+        location in lat/lng *1e7
+        '''
+        latlon = (m.lat*1.0e-7, m.lng*1.0e-7)
+        yaw = math.degrees(m.yaw)
+        self.update_vehicle_icon_to_loc(name, vehicle, colour, display, latlon, yaw)
+
+    def update_vehicle_icon_to_loc(self, name, vehicle, colour, display, latlon, yaw):
+        '''update display of a vehicle on the map at latlon
+        '''
+        key = name + vehicle
+
+        # don't display this icon if the settings don't say so:
+        if not display:
+            # remove from display if it was being displayed:
+            self.remove_vehicle_icon(key)
+            return
+
+        # create the icon if we weren't displaying:
+        self.create_vehicle_icon(key, colour)
+
+        # update placement on map:
+        self.map.set_position(key, latlon, rotation=yaw)
+
     def mavlink_packet(self, m):
         '''handle an incoming mavlink packet'''
         from MAVProxy.modules.mavproxy_map import mp_slipmap
@@ -962,34 +1159,24 @@ class MapModule(mp_module.MPModule):
         # in the air at the same time
         vehicle = 'Vehicle%u' % m.get_srcSystem()
 
-        if mtype == "SIMSTATE" and self.map_settings.showsimpos:
-            self.create_vehicle_icon('Sim' + vehicle, 'green')
-            self.map.set_position('Sim' + vehicle, (m.lat*1.0e-7, m.lng*1.0e-7), rotation=math.degrees(m.yaw))
-
+        if mtype == "SIMSTATE":
+            self.update_vehicle_icon('Sim', vehicle, 'green', m, self.map_settings.showsimpos)
         elif mtype == "AHRS2" and self.map_settings.showahrs2pos:
-            self.create_vehicle_icon('AHRS2' + vehicle, 'blue')
-            self.map.set_position('AHRS2' + vehicle, (m.lat*1.0e-7, m.lng*1.0e-7), rotation=math.degrees(m.yaw))
-
+            self.update_vehicle_icon('AHRS2', vehicle, 'purple', m, self.map_settings.showahrs2pos)
         elif mtype == "AHRS3" and self.map_settings.showahrs3pos:
-            self.create_vehicle_icon('AHRS3' + vehicle, 'orange')
-            self.map.set_position('AHRS3' + vehicle, (m.lat*1.0e-7, m.lng*1.0e-7), rotation=math.degrees(m.yaw))
-
-        elif mtype == "GPS_RAW_INT" and self.map_settings.showgpspos:
+            self.update_vehicle_icon('AHRS3', vehicle, 'orange', m, self.map_settings.showahrs3pos)
+        elif mtype == "GPS_RAW_INT":
             (lat, lon) = (m.lat*1.0e-7, m.lon*1.0e-7)
             if lat != 0 or lon != 0:
                 if m.vel > 300 or m.get_srcSystem() not in self.lat_lon_heading:
                     heading = m.cog*0.01
                 else:
                     (_,_,heading) = self.lat_lon_heading[m.get_srcSystem()]
-                self.create_vehicle_icon('GPS' + vehicle, 'blue')
-                self.map.set_position('GPS' + vehicle, (lat, lon), rotation=heading)
-                            
-        elif mtype == "GPS2_RAW" and self.map_settings.showgps2pos:
+                self.update_vehicle_icon_to_loc('GPS', vehicle, 'blue', self.map_settings.showgpspos, (lat, lon), heading)
+        elif mtype == "GPS2_RAW":
             (lat, lon) = (m.lat*1.0e-7, m.lon*1.0e-7)
             if lat != 0 or lon != 0:
-                self.create_vehicle_icon('GPS2' + vehicle, 'green')
-                self.map.set_position('GPS2' + vehicle, (lat, lon), rotation=m.cog*0.01)
-
+                self.update_vehicle_icon_to_loc('GPS2', vehicle, 'green', self.map_settings.showgps2pos, (lat, lon), m.cog*0.01)
         elif mtype == 'GLOBAL_POSITION_INT':
             (lat, lon, heading) = (m.lat*1.0e-7, m.lon*1.0e-7, m.hdg*0.01)
             self.lat_lon_heading[m.get_srcSystem()] = (lat,lon,heading)
@@ -1003,6 +1190,8 @@ class MapModule(mp_module.MPModule):
                         label = None
                     self.map.set_position('Pos' + vehicle, (lat, lon), rotation=heading, label=label, colour=(255,255,255))
                     self.map.set_follow_object('Pos' + vehicle, self.message_is_from_primary_vehicle(m))
+            else:
+                self.remove_vehicle_icon('Pos' + vehicle)
 
         elif mtype == "HIGH_LATENCY2" and self.map_settings.showahrspos:
             (lat, lon) = (m.latitude*1.0e-7, m.longitude*1.0e-7)
@@ -1148,6 +1337,134 @@ class MapModule(mp_module.MPModule):
 
                     points.append((nearest_land_wp.x, nearest_land_wp.y))
                     self.map.add_object(mp_slipmap.SlipPolygon('Rally Land %u' % (i+1), points, 'RallyPoints', (255,255,0), 2))
+
+    def display_terrain_contours(self):
+        """
+        Show terrain contours
+        """
+        from MAVProxy.modules.mavproxy_map import mp_slipmap
+        import numpy as np
+
+        # configure matplotlib for non-gui use
+        import matplotlib
+        matplotlib.use('Agg') 
+
+        # disable interactive plotting mode
+        import matplotlib.pyplot as plt
+        plt.ioff()
+
+        terrain_module = self.module('terrain')
+        if terrain_module is None:
+            return
+
+        elevation_model = terrain_module.ElevationModel
+
+        # show contours if they have already been calculated
+        if len(self.terrain_contour_ids) > 0:
+            self.show_terrain_contours()
+            return
+
+        # centre terrain grid about clicked location
+        if self.mpstate.click_location is None:
+            return
+
+        (lat, lon) = self.mpstate.click_location
+
+        # retrieve grid options from map settings
+        grid_spacing = self.map_settings.contour_grid_spacing
+        grid_extent = self.map_settings.contour_grid_extent
+        levels = self.map_settings.contour_levels
+
+        # create mesh grid
+        x = np.arange(-0.5 * grid_extent, 0.5 * grid_extent, grid_spacing)
+        y = np.arange(-0.5 * grid_extent, 0.5 * grid_extent, grid_spacing)
+        x_grid, y_grid = np.meshgrid(x, y)
+
+        def terrain_surface(lat, lon, x, y):
+            """
+            Calculate terrain altitudes for the NED offsets (x, y)
+            centred on (lat, lon).
+            """
+            alt = []
+            for east in y:
+                alt_y = []
+                for north in x:
+                    (lat2, lon2) = mp_util.gps_offset(lat, lon, east, north)
+                    alt_y.append(elevation_model.GetElevation(lat2, lon2))
+                alt.append(alt_y)
+            return alt
+
+        def ned_to_latlon(contours, lat, lon):
+            """
+            Convert contour polygons in NED coordinates offset from (lat, lon)
+            to polygons in orthometric coordinates.
+            """
+            contours_latlon = []
+            for polygons in contours:
+                polygons_latlon = []
+                for polygon in polygons:
+                    polygon_latlon = []
+                    for point in polygon:
+                        (north, east) = point
+                        (lat2, lon2) = mp_util.gps_offset(lat, lon, east, north)
+                        polygon_latlon.append([lat2, lon2])
+                    polygons_latlon.append(polygon_latlon)
+                contours_latlon.append(polygons_latlon)
+            return contours_latlon
+
+        # generate surface and contours
+        z_grid = np.array(terrain_surface(lat, lon, x, y))
+        _, (ax1) = plt.subplots(1, 1, figsize=(10,10))
+        cs = ax1.contour(x_grid, y_grid, z_grid, levels=levels)
+        contours = ned_to_latlon(cs.allsegs, lat, lon)
+
+        # add terrain layer and contour polygons
+        self.map.add_object(mp_slipmap.SlipClearLayer('Terrain'))
+
+        self.terrain_contour_ids.clear()
+        num_contours = len(contours)
+        for i in range(num_contours):
+            polygons = contours[i]
+            for j in range(len(polygons)):
+                p = polygons[j]
+                if len(p) > 1:
+                    id = f"terrain {i} {j}" 
+                    self.terrain_contour_ids.append(id)
+                    contour_colour = (255, 255, 255)
+                    self.map.add_object(mp_slipmap.SlipPolygon(
+                        id, p,
+                        layer='Terrain', linewidth=1,
+                        colour=contour_colour,
+                        showcircles=False
+                    ))
+
+    def show_terrain_contours(self):
+        """
+        Show terrain contours.
+        """
+        # unhide polygons
+        for id in self.terrain_contour_ids:
+            self.map.hide_object(id, hide=False)
+
+    def hide_terrain_contours(self):
+        """
+        Hide terrain contours.
+        """
+        # hide polygons
+        for id in self.terrain_contour_ids:
+            self.map.hide_object(id, hide=True)
+
+    def remove_terrain_contours(self):
+        """
+        Remove terrain contours and the terrain clear layer.
+        """
+        # remove polygons
+        for id in self.terrain_contour_ids:
+            self.map.remove_object(id)
+        # remove layer
+        self.map.remove_object('Terrain')
+        self.terrain_contour_ids.clear()
+
 
 def init(mpstate):
     '''initialise module'''

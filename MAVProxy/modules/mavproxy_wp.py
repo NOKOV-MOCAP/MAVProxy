@@ -1,5 +1,8 @@
-#!/usr/bin/env python
-'''waypoint command handling'''
+'''
+waypoint command handling
+
+AP_FLAKE8_CLEAN
+'''
 
 from MAVProxy.modules.lib import mission_item_protocol
 from MAVProxy.modules.lib import mp_util
@@ -75,7 +78,7 @@ class WPModule(mission_item_protocol.MissionItemProtocolModule):
         '''handle an incoming mavlink packet'''
         mtype = m.get_type()
 
-        if mtype in ["WAYPOINT_CURRENT", "MISSION_CURRENT"]:
+        if mtype in ["MISSION_CURRENT"]:
             if m.seq != self.last_waypoint:
                 self.last_waypoint = m.seq
                 if self.settings.wpupdates:
@@ -132,7 +135,7 @@ class WPModule(mission_item_protocol.MissionItemProtocolModule):
         dist = float(args[1])
         bearing = float(args[2])
 
-        home = self.get_home()
+        home = self.get_WP0(home_only=True)
         if home is None:
             print("Need home")
             return
@@ -161,6 +164,7 @@ class WPModule(mission_item_protocol.MissionItemProtocolModule):
         ret.update({
             'add': self.cmd_add,
             "changealt": self.cmd_changealt,
+            "changeframe": self.cmd_changeframe,
             'draw': self.cmd_draw,
             'editor': self.cmd_editor,
             'loop': self.cmd_loop,
@@ -232,20 +236,37 @@ class WPModule(mission_item_protocol.MissionItemProtocolModule):
             return mavutil.mavlink.MAV_FRAME_GLOBAL_TERRAIN_ALT
         return mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT
 
-    def get_home(self):
-        '''get home location'''
-        if 'HOME_POSITION' in self.master.messages:
+    def get_WP0(self, home_only=False):
+        '''get a location for WP0 when building a mission
+        this ideally should be home, but if home is not available then use a click position
+        '''
+        (lat, lon, alt) = (None, None, None)
+        if self.master is not None and 'HOME_POSITION' in self.master.messages:
             h = self.master.messages['HOME_POSITION']
-            return mavutil.mavlink.MAVLink_mission_item_message(self.target_system,
-                                                                self.target_component,
-                                                                0,
-                                                                0,
-                                                                mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                                                                0, 0, 0, 0, 0, 0,
-                                                                h.latitude*1.0e-7, h.longitude*1.0e-7, h.altitude*1.0e-3)
-        if self.wploader.count() > 0:
+            (lat, lon, alt) = (h.latitude*1.0e-7, h.longitude*1.0e-7, h.altitude*1.0e-3)
+        elif home_only:
+            return None
+        elif self.wploader.count() > 0:
             return self.wploader.wp(0)
-        return None
+        else:
+            latlon = self.mpstate.click_location
+            if latlon is None:
+                return None
+            (lat, lon, alt) = (latlon[0], latlon[1], 0)
+        if lat is None or lon is None:
+            return None
+        w = mavutil.mavlink.MAVLink_mission_item_message(self.target_system,
+                                                         self.target_component,
+                                                         0,
+                                                         0,
+                                                         mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                                                         0, 0, 0, 0, 0, 0,
+                                                         lat, lon, alt)
+        return w
+
+    def get_home(self):
+        '''get a location for home'''
+        return self.get_WP0(home_only=True)
 
     def wp_draw_callback(self, points):
         '''callback from drawing waypoints'''
@@ -254,7 +275,7 @@ class WPModule(mission_item_protocol.MissionItemProtocolModule):
         self.wploader.target_system = self.target_system
         self.wploader.target_component = self.target_component
         if self.wploader.count() < 2:
-            home = self.get_home()
+            home = self.get_WP0()
             if home is None:
                 print("Need home location for draw - please run gethome")
                 return
@@ -272,7 +293,7 @@ class WPModule(mission_item_protocol.MissionItemProtocolModule):
         if 'draw_lines' not in self.mpstate.map_functions:
             print("No map drawing available")
             return
-        if self.get_home() is None:
+        if self.get_WP0() is None:
             print("Need home location - please run gethome")
             return
         if len(args) > 1:
@@ -288,31 +309,39 @@ class WPModule(mission_item_protocol.MissionItemProtocolModule):
             self.mpstate.functions.process_stdin("module load misseditor", immediate=True)
 
     def cmd_set(self, args):
-        if len(args) != 1:
-            print("usage: wp set <wpindex>")
+        usage = "usage: wp set <wpindex> [reset]"
+        reset = False
+        if len(args) == 2:
+            if args[1] != "reset":
+                print(usage)
+                return
+            reset = True
+        elif len(args) != 1:
+            print(usage)
             return
 
         wp_num = int(args[0])
 
-        # At time of writing MAVProxy sends to (1, 0) by default,
-        # but ArduPilot will respond from (1,1) by default -and
-        # that means COMMAND_ACK handling will fill
-        # self.accepts_DO_SET_MISSION_CURRENT for (1, 1) and we
-        # will not get that value here:
         key = (self.target_system, self.target_component)
         supports = self.accepts_DO_SET_MISSION_CURRENT.get(key, None)
         # if we don't know, send both.  If we do know, send only one.
         # we "know" because we hook receipt of COMMAND_ACK.
 
         if self.settings.wp_use_waypoint_set_current or supports is False:
+            if reset:
+                print("Reset unavailable, wp command NOT executed")
+                return
             self.master.waypoint_set_current_send(wp_num)
         else:
+            p2 = 0
+            if reset:
+                p2 = 1
             self.master.mav.command_long_send(
                 self.target_system,
                 self.target_component,
                 mavutil.mavlink.MAV_CMD_DO_SET_MISSION_CURRENT,
                 0,
-                wp_num, 0, 0, 0, 0, 0, 0
+                wp_num, p2, 0, 0, 0, 0, 0
             )
 
     def cmd_add(self, args):
@@ -396,7 +425,7 @@ class WPModule(mission_item_protocol.MissionItemProtocolModule):
                                                           wptype,
                                                           0, 1, 0, 0, 0, 0, latlon[0], latlon[1], takeoff_alt)
         if self.wploader.count() < 2:
-            home = self.get_home()
+            home = self.get_WP0()
             if home is None:
                 print("Need home location - please run gethome")
                 return
@@ -524,18 +553,23 @@ class WPModule(mission_item_protocol.MissionItemProtocolModule):
             print("wp is not a location command")
             return
 
-        prev = num - 1
-        if prev < 1 or prev > self.wploader.count():
-            print("Bad item %u" % num)
-            return
-        prev_wp = self.wploader.wp(prev)
-        if prev_wp is None:
-            print("Could not get previous wp %u" % prev)
-            return
-        prev_loc = self.get_loc(prev_wp)
-        if prev_loc is None:
-            print("previous wp is not a location command")
-            return
+        prev = num
+        while True:
+            prev = prev - 1
+            if prev < 1 or prev > self.wploader.count():
+                print("Bad item %u" % num)
+                return
+            prev_wp = self.wploader.wp(prev)
+            if prev_wp is None:
+                print("Could not get previous wp %u" % prev)
+                return
+            if prev_wp.command == mavutil.mavlink.MAV_CMD_DO_LAND_START:
+                continue
+            prev_loc = self.get_loc(prev_wp)
+            if prev_loc is None:
+                print("previous wp is not a location command")
+                return
+            break
 
         if wp.frame != prev_wp.frame:
             print("waypoints differ in frame (%u vs %u)" %

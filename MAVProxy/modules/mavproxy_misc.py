@@ -1,16 +1,23 @@
-#!/usr/bin/env python
-'''miscellaneous commands'''
+#!/usr/bin/env python3
+'''
+miscellaneous commands
 
-import time, math, sys
+AP_FLAKE8_CLEAN
+'''
+
+import math
+import os
+import sys
+import time
+
 from pymavlink import mavutil
 
 from MAVProxy.modules.lib import mp_module
 from MAVProxy.modules.lib import mp_util
 
-
-from os import kill
 from signal import signal
 from subprocess import PIPE, Popen
+
 
 class RepeatCommand(object):
     '''repeated command object'''
@@ -23,27 +30,26 @@ class RepeatCommand(object):
         return "Every %.1f seconds: %s" % (self.period, self.cmd)
 
 
-def run_command(args, cwd = None, shell = False, timeout = None, env = None):
+def run_command(args, cwd=None, shell=False, timeout=None, env=None):
     '''
     Run a shell command with a timeout.
     See http://stackoverflow.com/questions/1191374/subprocess-with-timeout
     '''
-    from subprocess import PIPE, Popen
     try:
         # py2
         from StringIO import StringIO
     except ImportError:
         # py3
         from io import StringIO
-    import fcntl, os, signal
-    p = Popen(args, shell = shell, cwd = cwd, stdout = PIPE, stderr = PIPE, env = env)
+    import fcntl
+    p = Popen(args, shell=shell, cwd=cwd, stdout=PIPE, stderr=PIPE, env=env)
     tstart = time.time()
     buf = StringIO()
 
     # try to make it non-blocking
     try:
         fcntl.fcntl(p.stdout, fcntl.F_SETFL, fcntl.fcntl(p.stdout, fcntl.F_GETFL) | os.O_NONBLOCK)
-    except Exception as ex:
+    except Exception:
         pass
 
     while True:
@@ -54,7 +60,7 @@ def run_command(args, cwd = None, shell = False, timeout = None, env = None):
             if sys.version_info.major >= 3:
                 s = s.decode('utf-8')
             buf.write(s)
-        except Exception as ex:
+        except Exception:
             pass
         if retcode is not None:
             break
@@ -66,6 +72,7 @@ def run_command(args, cwd = None, shell = False, timeout = None, env = None):
                 pass
             p.wait()
     return buf.getvalue()
+
 
 class MiscModule(mp_module.MPModule):
     def __init__(self, mpstate):
@@ -95,9 +102,12 @@ class MiscModule(mp_module.MPModule):
         self.add_command('hardfault_autopilot', self.cmd_hardfault_autopilot, "hardfault autopilot")
         self.add_command('panic_autopilot', self.cmd_panic_autopilot, "panic autopilot")
         self.add_command('longloop_autopilot', self.cmd_longloop_autopilot, "cause long loop in autopilot")
+        self.add_command('configerror_autopilot', self.cmd_config_error_autopilot, "ask autopilot to jump to its config error loop")  # noqa:E501
         self.add_command('internalerror_autopilot', self.cmd_internalerror_autopilot, "cause internal error in autopilot")
         self.add_command('dfu_boot', self.cmd_dfu_boot, "boot into DFU mode")
         self.add_command('deadlock', self.cmd_deadlock, "trigger deadlock")
+        self.add_command('nullptr_read', self.cmd_nullptr_read, "read from a very low address")
+        self.add_command('nullptr_write', self.cmd_nullptr_write, "write to a very low address")
         self.add_command('batreset', self.cmd_battery_reset, "reset battery remaining")
         self.add_command('setorigin', self.cmd_setorigin, "set global origin")
         self.add_command('magsetfield', self.cmd_magset_field, "set expected mag field by field")
@@ -108,8 +118,11 @@ class MiscModule(mp_module.MPModule):
         self.add_command('canforward', self.cmd_canforward, "enable CAN forwarding")
 
         self.add_command('gear', self.cmd_landing_gear, "landing gear control")
-        
+
         self.repeats = []
+
+        # support for changing altitude via command rather than mission item:
+        self.accepts_DO_CMD_CHANGE_ALTITUDE = {}  # keyed by (sysid, compid)
 
     def altitude_difference(self, pressure1, pressure2, ground_temp):
         '''calculate barometric altitude'''
@@ -253,10 +266,22 @@ class MiscModule(mp_module.MPModule):
         '''boot into DFU bootloader without hold'''
         self.cmd_dosomethingreallynastyto_autopilot(args, 'DFU-boot-without-hold', 99)
 
+    def cmd_config_error_autopilot(self, args):
+        '''Ask the autopilot to jump into its config error loop'''
+        self.cmd_dosomethingreallynastyto_autopilot(args, 'config-loop', 101)
+
     def cmd_deadlock(self, args):
         '''trigger a mutex deadlock'''
         self.cmd_dosomethingreallynastyto_autopilot(args, 'mutex-deadlock', 100)
-        
+
+    def cmd_nullptr_write(self, args):
+        '''write to a low address (nullptr-deref)'''
+        self.cmd_dosomethingreallynastyto_autopilot(args, 'nullptr-deref-write', 102)
+
+    def cmd_nullptr_read(self, args):
+        '''read from a low address (nullptr-deref)'''
+        self.cmd_dosomethingreallynastyto_autopilot(args, 'nullptr-deref-read', 103)
+
     def cmd_battery_reset(self, args):
         '''reset battery remaining'''
         mask = -1
@@ -267,7 +292,7 @@ class MiscModule(mp_module.MPModule):
             remaining_pct = int(args[1])
         self.master.mav.command_long_send(self.settings.target_system, self.settings.target_component,
                                           mavutil.mavlink.MAV_CMD_BATTERY_RESET, 0,
-                                              mask, remaining_pct, 0, 0, 0, 0, 0)
+                                          mask, remaining_pct, 0, 0, 0, 0, 0)
 
     def cmd_time(self, args):
         '''show autopilot time'''
@@ -277,20 +302,46 @@ class MiscModule(mp_module.MPModule):
             return
         print("%s (%s)\n" % (time.ctime(tusec * 1.0e-6), time.ctime()))
 
+    def _cmd_changealt(self, alt, frame):
+        '''send commands.  May send both if we don't know which is the
+        right one to set'''
+        key = (self.target_system, self.target_component)
+        supports = self.accepts_DO_CMD_CHANGE_ALTITUDE.get(key, None)
+        if supports or supports is None:
+            self.master.mav.command_long_send(
+                self.settings.target_system,
+                self.settings.target_component,
+                mavutil.mavlink.MAV_CMD_DO_CHANGE_ALTITUDE,
+                0,        # confirmation
+                alt,      # p1
+                frame,    # p2
+                0,
+                0,
+                0,
+                0,
+                0
+            )
+            print(f"Sent change altitude command for {alt:.2f} meters")
+
+        if supports is True:
+            return
+
+        self.master.mav.mission_item_send(self.settings.target_system,
+                                          self.settings.target_component,
+                                          0,
+                                          frame,
+                                          mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+                                          3, 1, 0, 0, 0, 0,
+                                          0, 0, alt)
+        print("Sent change altitude mission item command for %.1f meters" % alt)
+
     def cmd_changealt(self, args):
         '''change target altitude'''
         if len(args) < 1:
             print("usage: changealt <relaltitude>")
             return
         relalt = float(args[0])
-        self.master.mav.mission_item_send(self.settings.target_system,
-                                          self.settings.target_component,
-                                          0,
-                                          3,
-                                          mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                                          3, 1, 0, 0, 0, 0,
-                                          0, 0, relalt)
-        print("Sent change altitude command for %.1f meters" % relalt)
+        self._cmd_changealt(relalt, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT)
 
     def cmd_changealt_abs(self, args):
         '''change target altitude'''
@@ -298,15 +349,8 @@ class MiscModule(mp_module.MPModule):
             print("usage: changealt_abs <absaltitude>")
             return
         absalt = float(args[0])
-        self.master.mav.mission_item_send(self.settings.target_system,
-                                          self.settings.target_component,
-                                          0,
-                                          0,
-                                          mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
-                                          3, 1, 0, 0, 0, 0,
-                                          0, 0, absalt)
-        print("Sent change altitude command for %.1f meters" % absalt)
-        
+        self._cmd_changealt(absalt, mavutil.mavlink.MAV_FRAME_GLOBAL)
+
     def cmd_land(self, args):
         '''auto land commands'''
         if len(args) < 1:
@@ -365,13 +409,13 @@ class MiscModule(mp_module.MPModule):
         pattern[0] = int(args[0])
         pattern[1] = int(args[1])
         pattern[2] = int(args[2])
-        
+
         if len(args) == 4:
             plen = 4
             pattern[3] = int(args[3])
         else:
             plen = 3
-            
+
         self.master.mav.led_control_send(self.settings.target_system,
                                          self.settings.target_component,
                                          0, 0, plen, pattern)
@@ -398,7 +442,7 @@ class MiscModule(mp_module.MPModule):
             mavutil.mavlink.MAV_CMD_SCRIPTING,
             0, 0,
             cmd,
-            0,0,0,0,0,0)
+            0, 0, 0, 0, 0, 0)
 
     def cmd_formatsdcard(self, args):
         '''format SD card'''
@@ -408,8 +452,8 @@ class MiscModule(mp_module.MPModule):
             mavutil.mavlink.MAV_CMD_STORAGE_FORMAT,
             0, 0,
             1, 1,
-            0,0,0,0,0)
-        
+            0, 0, 0, 0, 0)
+
     def cmd_oreoled(self, args):
         '''send LED pattern as override, using OreoLED conventions'''
         if len(args) < 4:
@@ -425,18 +469,20 @@ class MiscModule(mp_module.MPModule):
         pattern[5] = int(args[1])
         pattern[6] = int(args[2])
         pattern[7] = int(args[3])
-        
+
         self.master.mav.led_control_send(self.settings.target_system,
                                          self.settings.target_component,
                                          lednum, 255, 8, pattern)
-        
+
     def cmd_flashbootloader(self, args):
         '''flash bootloader'''
-        self.master.mav.command_long_send(self.settings.target_system,
-                                          0,
-                                          mavutil.mavlink.MAV_CMD_FLASH_BOOTLOADER,
-                                              0, 0, 0, 0, 0, 290876, 0, 0)
-        
+        self.master.mav.command_long_send(
+            self.settings.target_system,
+            0,
+            mavutil.mavlink.MAV_CMD_FLASH_BOOTLOADER,
+            0, 0, 0, 0, 0, 290876, 0, 0
+        )
+
     def cmd_playtune(self, args):
         '''send PLAY_TUNE message'''
         if len(args) < 1:
@@ -488,7 +534,7 @@ class MiscModule(mp_module.MPModule):
             if p.startswith('COMPASS_DEV_ID') or p.startswith('COMPASS_PRIO') or (
                     p.startswith('COMPASS') and p.endswith('DEV_ID')):
                 mp_util.decode_devid(self.mav_param[p], p)
-            if p.startswith('INS_') and p.endswith('_ID'):
+            if p.startswith('INS') and p.endswith('_ID'):
                 mp_util.decode_devid(self.mav_param[p], p)
             if p.startswith('GND_BARO') and p.endswith('_ID'):
                 mp_util.decode_devid(self.mav_param[p], p)
@@ -604,46 +650,65 @@ class MiscModule(mp_module.MPModule):
             0,
             0,
             0)
-    
+
     def cmd_landing_gear(self, args):
-        usage='''Usage: gear <up|down> [ID]
+        usage = '''Usage: gear <up|down> [ID]
 Alt: gear <extend|retract> [ID]'''
-        if len(args) == 0 or args[0] not in ['up','down','extend', 'retract']:
+        if len(args) == 0 or args[0] not in ['up', 'down', 'extend', 'retract']:
             print(usage)
             return
-        if args[0] in ['down','extend']:
-            DesiredState=0
-        elif args [0] in ['up','retract']:
-            DesiredState=1
+        if args[0] in ['down', 'extend']:
+            DesiredState = 0
+        elif args[0] in ['up', 'retract']:
+            DesiredState = 1
         else:
             print(usage)
             return
-        if len(args)==1:
-            ID=-1
-        elif len(args)==2:
+        if len(args) == 1:
+            ID = -1
+        elif len(args) == 2:
             try:
-                ID=int(args[1])
+                ID = int(args[1])
             except ValueError:
                 print(usage)
                 return
-            if ID<-1:
+            if ID < -1:
                 print(usage)
                 return
         else:
             print(usage)
             return
-        self.master.mav.command_long_send(self.target_system,
-                                               self.target_component,
-                                               mavutil.mavlink.MAV_CMD_AIRFRAME_CONFIGURATION , 0, 
-                                               ID,
-                                               DesiredState,
-                                               0, 0, 0, 0, 0, 0)
-    
+        self.master.mav.command_long_send(
+            self.target_system,
+            self.target_component,
+            mavutil.mavlink.MAV_CMD_AIRFRAME_CONFIGURATION , 0,
+            ID,
+            DesiredState,
+            0, 0, 0, 0, 0, 0
+        )
+
+    def mavlink_packet(self, m):
+        '''handle an incoming mavlink packet'''
+        mtype = m.get_type()
+
+        if mtype == "COMMAND_ACK":
+            # check to see if the vehicle has bounced our attempts to
+            # set the current mission item via mavlink command (as
+            # opposed to the old message):
+            if m.command == mavutil.mavlink.MAV_CMD_DO_CHANGE_ALTITUDE:
+                key = (m.get_srcSystem(), m.get_srcComponent())
+                if m.result == mavutil.mavlink.MAV_RESULT_UNSUPPORTED:
+                    # stop sending the commands:
+                    self.accepts_DO_CMD_CHANGE_ALTITUDE[key] = False
+                elif m.result in [mavutil.mavlink.MAV_RESULT_ACCEPTED]:
+                    self.accepts_DO_CMD_CHANGE_ALTITUDE[key] = True
+
     def idle_task(self):
         '''called on idle'''
         for r in self.repeats:
             if r.event.trigger():
                 self.mpstate.functions.process_stdin(r.cmd, immediate=True)
+
 
 def init(mpstate):
     '''initialise module'''

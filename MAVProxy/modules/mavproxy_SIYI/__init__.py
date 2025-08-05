@@ -11,6 +11,7 @@ from MAVProxy.modules.lib import mp_module
 from MAVProxy.modules.lib import mp_settings
 from MAVProxy.modules.lib.mp_settings import MPSetting
 from MAVProxy.modules.lib import mp_util
+from MAVProxy.modules.lib import camera_projection
 from pymavlink import mavutil
 from pymavlink import DFReader
 from pymavlink.rotmat import Matrix3
@@ -21,6 +22,7 @@ from threading import Thread
 import cv2
 import traceback
 import copy
+import datetime
 
 import socket, time, os, struct
 
@@ -34,6 +36,7 @@ if mp_util.has_wxpython:
     from MAVProxy.modules.lib.mp_image import MPImageOSD_None
 
 from MAVProxy.modules.mavproxy_SIYI.camera_view import CameraView
+from MAVProxy.modules.mavproxy_SIYI.raw_thermal import RawThermal
 
 SIYI_RATE_MAX_DPS = 90.0
 SIYI_HEADER1 = 0x55
@@ -77,6 +80,12 @@ SET_THERMAL_PARAM = 0x3A
 GET_THERMAL_ENVSWITCH = 0x3B
 SET_THERMAL_ENVSWITCH = 0x3C
 SET_TIME = 0x30
+GET_THERMAL_THRESH_STATE = 0x42
+SET_THERMAL_THRESH_STATE = 0x43
+GET_THERMAL_THRESH = 0x44
+SET_THERMAL_THRESH = 0x45
+GET_THERMAL_THRESH_PREC = 0x46
+SET_THERMAL_THRESH_PREC = 0x47
 
 class ThermalParameters:
     def __init__(self, distance, target_emissivity, humidity, air_temperature, reflection_temperature):
@@ -173,7 +182,9 @@ class DF_logger:
         if not name in self.formats:
             self.formats[name] = self.mlog.add_format(DFReader.DFFormat(0, name, 0, fmt, fields))
             self.outf.write(self.mlog.make_format_msgbuf(self.formats[name]))
-        self.outf.write(self.mlog.make_msgbuf(self.formats[name], args))
+        nfields = len(fields.split(','))
+        if nfields <= 14:
+            self.outf.write(self.mlog.make_msgbuf(self.formats[name], args))
         now = time.time()
         if now - self.last_flush > 5:
             self.last_flush = now
@@ -225,9 +236,10 @@ class SIYIModule(mp_module.MPModule):
         self.add_command('siyi', self.cmd_siyi, "SIYI camera control",
                          ["<rates|connect|autofocus|zoom|yaw|pitch|center|getconfig|angle|photo|recording|lock|follow|fpv|settarget|notarget|thermal|rgbview|tempsnap|get_thermal_mode|thermal_gain|get_thermal_gain|settime>",
                           "<therm_getenv|therm_set_distance|therm_set_emissivity|therm_set_humidity|therm_set_airtemp|therm_set_reftemp|therm_getswitch|therm_setswitch>",
+                          "<therm_getthresholds|therm_getthreshswitch|therm_setthresholds|therm_setthreshswitch>",
                           "set (SIYISETTING)",
                           "imode <1|2|3|4|5|6|7|8|wide|zoom|split>",
-                          "palette <WhiteHot|Sepia|Ironbow|Rainbow|Night|Aurora|RedHot|Jungle|Medical|BlackHot|GloryHot>",
+                          "palette <WhiteHot|GloryHot>",
                           "thermal_mode <0|1>",
                           ])
 
@@ -245,6 +257,7 @@ class SIYIModule(mp_module.MPModule):
                                                      ('pitch_gain_I', float, 1),
                                                      ('pitch_gain_IMAX', float, 5),
                                                      ('mount_pitch', float, 0),
+                                                     ('mount_alt', float, 0),
                                                      ('mount_yaw', float, 0),
                                                      ('lag', float, 0),
                                                      ('target_rate', float, 10),
@@ -272,13 +285,25 @@ class SIYIModule(mp_module.MPModule):
                                                      ('att_control', int, 0),
                                                      ('therm_cap_rate', float, 0),
                                                      ('show_horizon', int, 0),
+                                                     ('autoflag_temp', float, 120),
+                                                     ('autoflag_enable', bool, False),
+                                                     ('autoflag_dist', float, 30),
+                                                     ('autoflag_history', float, 50),
+                                                     ('autoflag_slices', int, 4),
+                                                     ('autoflag_radius', int, 100),
                                                      ('track_ROI', int, 1),
+                                                     ('fetch_timeout', float, 2.0),
                                                      MPSetting('thresh_climit', int, 50, range=(10,50)),
                                                      MPSetting('thresh_volt', int, 80, range=(20,80)),
                                                      MPSetting('thresh_ang', int, 4000, range=(30,4000)),
                                                      MPSetting('thresh_climit_dis', int, 20, range=(10,50)),
                                                      MPSetting('thresh_volt_dis', int, 40, range=(20,80)),
                                                      MPSetting('thresh_ang_dis', int, 40, range=(30,4000)),
+                                                     ('force_strong_gimballing', bool, False),
+                                                     ('stow_on_landing', bool, True),
+                                                     ('stow_heuristics_enabled', bool, True),
+                                                     ('stow_heuristics_minalt', float, 20.0),  # metres above terrain
+                                                     ('stow_heuristics_maxhorvel', float, 2.0),  # metres/second
                                                          ])
         self.add_completion_function('(SIYISETTING)',
                                      self.siyi_settings.completion)
@@ -329,6 +354,7 @@ class SIYIModule(mp_module.MPModule):
         self.last_att_send_t = time.time()
         self.last_temp_t = time.time()
         self.thermal_view = None
+        self.rawthermal_view = None
         self.rgb_view = None
         self.last_zoom = 1.0
         self.rgb_lens = "wide"
@@ -337,13 +363,34 @@ class SIYIModule(mp_module.MPModule):
         self.last_SIEA = time.time()
         self.last_therm_cap = time.time()
         self.thermal_capture_count = 0
+        self.thermal_data_count = 0
         self.last_therm_mode = time.time()
+        self.named_float_seq = 0
 
         self.recv_thread = Thread(target=self.receive_thread, name='SIYI_Receive')
         self.recv_thread.daemon = True
         self.recv_thread.start()
         self.have_horizon_lines = False
         self.thermal_param = None
+        self.last_armed = False
+        self.getconfig_pending = False
+        self.last_getconfig = time.time()
+        self.click_mode = "Flag"
+
+        # support for stowing the camera when we start to land:
+        self.extended_sys_state_received_time = 0
+        self.extended_sys_state_request_time = 0
+        self.extended_sys_state_warn_time = 0  # last time we warned about not being able to auto-stow
+        self.last_landed_state = None
+
+        self.have_DATA96 = False
+
+        # support retracting camera based on heuristics:
+        self.landing_heuristics = {
+            "armed": True,
+            "last_warning_ms": 0,
+            "current_terrain_alt": 0,
+        }
 
         if mp_util.has_wxpython:
             menu = MPMenuSubMenu('SIYI',
@@ -361,16 +408,26 @@ class SIYIModule(mp_module.MPModule):
                                      MPMenuItem('Recording', 'Recording', '# siyi recording '),
                                      MPMenuItem('ClearTarget', 'ClearTarget', '# siyi notarget '),
                                      MPMenuItem('ThermalView', 'Thermalview', '# siyi thermal '),
+                                     MPMenuItem('RawThermalView', 'RawThermalview', '# siyi rawthermal '),
                                      MPMenuItem('RGBView', 'RGBview', '# siyi rgbview '),
                                      MPMenuItem('ResetAttitude', 'ResetAttitude', '# siyi resetattitude '),
                                      MPMenuSubMenu('Zoom',
                                                    items=[MPMenuItem('Zoom%u'%z, 'Zoom%u'%z, '# siyi zoom %u ' % z) for z in range(1,11)]),
                                      MPMenuSubMenu('ThermalGain',
-                                                   items=[MPMenuItem('HighGain', 'HighGain', '# siyi thermal_gain 1'),
-                                                          MPMenuItem('LowGain', 'LowGain', '# siyi thermal_gain 0')]),
+                                                   items=[MPMenuItem('HighGain(LowTemp)', 'HighGain', '# siyi thermal_gain 1'),
+                                                          MPMenuItem('LowGain(HighTemp)', 'LowGain', '# siyi thermal_gain 0'),
+                                                          MPMenuItem('ThreshOff', 'ThreshOff', '# siyi therm_setthreshswitch 0')]),
 
                                      MPMenuSubMenu('Threshold',
-                                                  items=[MPMenuItem('Threshold%u'%z, 'Threshold%u'%z, '# siyi set threshold_temp %u ' % z) for z in range(20,115,5)])])
+                                                  items=[MPMenuItem('Threshold%u'%z, 'Threshold%u'%z, '# siyi set threshold_temp %u ' % z) for z in range(20,115,5)]),
+                                     MPMenuSubMenu('AutoFlag',
+                                                   items=[MPMenuItem('Enable', 'AutoFlagEnable', '# siyi set autoflag_enable 1'),
+                                                          MPMenuItem('Disable', 'AutoFlagDisable', '# siyi set autoflag_enable 0'),
+                                                          MPMenuItem('Clear', 'AutoFlagClear', '# siyi autoflag_clear'),
+                                                          MPMenuItem('Reload', 'AutoFlagReload', '# siyi autoflag_reload'),
+                                                          MPMenuItem('Discard', 'AutoFlagDiscard', '# siyi autoflag_discard'),
+                                                          ]),
+                                     ])
             map = self.module('map')
             if map is not None:
                 map.add_menu(menu)
@@ -411,6 +468,7 @@ class SIYIModule(mp_module.MPModule):
             self.cmd_zoom(args[1:])
         elif args[0] == "getconfig":
             self.send_packet(ACQUIRE_GIMBAL_CONFIG_INFO, None)
+            self.getconfig_pending = False
         elif args[0] == "angle":
             self.cmd_angle(args[1:])
         elif args[0] == "photo":
@@ -428,6 +486,7 @@ class SIYIModule(mp_module.MPModule):
         elif args[0] == "recording":
             self.send_packet_fmt(PHOTO, "<B", 2)
             self.send_packet(FUNCTION_FEEDBACK_INFO, None)
+            print("Toggled recording")
         elif args[0] == "resetattitude":
             self.send_packet(RESET_ATTITUDE, None)
         elif args[0] == "lock":
@@ -446,6 +505,8 @@ class SIYIModule(mp_module.MPModule):
             self.cmd_palette(args[1:])
         elif args[0] == "thermal":
             self.cmd_thermal()
+        elif args[0] == "rawthermal":
+            self.cmd_rawthermal()
         elif args[0] == "rgbview":
             self.cmd_rgbview()
         elif args[0] == "therm_getenv":
@@ -464,8 +525,22 @@ class SIYIModule(mp_module.MPModule):
             self.send_packet_fmt(GET_THERMAL_ENVSWITCH, None)
         elif args[0] == "therm_setswitch":
             self.send_packet_fmt(SET_THERMAL_ENVSWITCH, "<B", int(args[1]))
+        elif args[0] == "therm_getthreshswitch":
+            self.send_packet_fmt(GET_THERMAL_THRESH_STATE, None)
+        elif args[0] == "therm_setthreshswitch":
+            self.send_packet_fmt(SET_THERMAL_THRESH_STATE, "<B", int(args[1]))
+        elif args[0] == "therm_getthresholds":
+            self.send_packet_fmt(GET_THERMAL_THRESH, None)
+        elif args[0] == "therm_setthresholds":
+            self.therm_set_thresholds(args[1:])
         elif args[0] == "settime":
             self.cmd_settime()
+        elif args[0] == "autoflag_clear":
+            self.autoflag_clear()
+        elif args[0] == "autoflag_reload":
+            self.autoflag_reload()
+        elif args[0] == "autoflag_discard":
+            self.autoflag_discard()
         else:
             print(usage)
 
@@ -565,6 +640,10 @@ class SIYIModule(mp_module.MPModule):
                                        fps=self.siyi_settings.fps_thermal,
                                        video_idx=idx)
 
+    def cmd_rawthermal(self):
+        '''open raw thermal viewer'''
+        self.rawthermal_view = RawThermal(self, (640,512))
+
     def cmd_rgbview(self):
         '''open rgb viewer'''
         vidfile,idx = self.video_filename('rgb')
@@ -577,6 +656,8 @@ class SIYIModule(mp_module.MPModule):
         '''check for mouse events on thermal image'''
         if self.thermal_view is not None:
             self.thermal_view.check_events()
+        if self.rawthermal_view is not None:
+            self.rawthermal_view.check_events()
         if self.rgb_view is not None:
             self.rgb_view.check_events()
 
@@ -649,7 +730,23 @@ class SIYIModule(mp_module.MPModule):
         p = copy.copy(self.thermal_param)
         p.reflection_temperature = reftemp
         self.send_packet_fmt(SET_THERMAL_PARAM, "<HHHHH", *p.args())
-        
+
+    def therm_set_thresholds(self, args):
+        '''set thermal thresholds
+        format: therm_setthresholds 30 102,204,255 40 102,204,255 50 102,204,255 80
+        '''
+        if len(args) != 7:
+            print("Usage: therm_setthresholds T1 R,G,B T2 R,G,B T3 R,G,B T4")
+            return
+        temps = [int(args[0]), int(args[2]), int(args[4]), int(args[6])]
+        colors = []
+        for i in [1,3,5]:
+            colors.append([int(x) for x in args[i].split(',')])
+        self.send_packet_fmt(SET_THERMAL_THRESH, "<BhhBBBBhhBBBBhhBBB",
+                             1, temps[0], temps[1], *colors[0],
+                             1, temps[1], temps[2], *colors[1],
+                             1, temps[2], temps[3], *colors[2])
+
     def clear_target(self):
         '''clear target position'''
         self.target_pos = None
@@ -766,8 +863,15 @@ class SIYIModule(mp_module.MPModule):
         if fmt is None:
             fmt = ""
             args = []
-        self.send_packet(command_id, struct.pack(fmt, *args))
+        try:
+            self.send_packet(command_id, struct.pack(fmt, *args))
+        except Exception as ex:
+            print(ex)
+            print(fmt, args)
+            return
         args = list(args)
+        if len(args) > 8:
+            args = args[:8]
         args.extend([0]*(8-len(args)))
         self.logf.write('SIOU', 'QBffffffff', 'TimeUS,Cmd,P1,P2,P3,P4,P5,P6,P7,P8', self.micros64(), command_id, *args)
 
@@ -835,12 +939,24 @@ class SIYIModule(mp_module.MPModule):
                                 z,y,x,sz,sy,sx)
 
         elif cmd == ACQUIRE_GIMBAL_CONFIG_INFO:
-            res, hdr_sta, res2, record_sta, gim_motion, gim_mount, video = self.unpack(cmd, "<BBBBBBB", data)
+            res, hdr_sta, res2, record_sta, gim_motion, gim_mount, video, x = self.unpack(cmd, "<BBBBBBBB", data)
+            self.console.set_status('REC', 'REC %u' % record_sta, row=6)
+            if self.getconfig_pending:
+                self.getconfig_pending = False
+                armed = self.master.motors_armed()
+                if armed and record_sta == 0:
+                    print("Starting recording")
+                    self.send_packet_fmt(PHOTO, "<B", 2)
+                if not armed and record_sta == 1:
+                    print("Stopping recording")
+                    self.send_packet_fmt(PHOTO, "<B", 2)
+                return
             print("HDR: %u" % hdr_sta)
             print("Recording: %u" % record_sta)
             print("GimbalMotion: %u" % gim_motion)
             print("GimbalMount: %u" % gim_mount)
             print("Video: %u" % video)
+            print("Unknown: %u" % x)
 
         elif cmd == READ_RANGEFINDER:
             r, = self.unpack(cmd, "<H", data)
@@ -848,7 +964,7 @@ class SIYIModule(mp_module.MPModule):
             self.last_rf_t = time.time()
             self.update_status()
             self.send_named_float('RFND', self.rf_dist)
-            SR = self.get_slantrange(0,0,0,1)
+            SR = self.get_slantrange(0,0,1,1)
             if SR is None:
                 SR = -1.0
             self.logf.write('SIRF', 'Qff', 'TimeUS,Dist,SR',
@@ -875,17 +991,18 @@ class SIYIModule(mp_module.MPModule):
                 self.have_horizon_lines = False
 
         elif cmd == READ_VOLTAGES:
-            y,p,r,mode,mode_ms, = self.unpack(cmd, "<hhhBI", data)
+            if len(data) == 11:
+                y,p,r,_,_,_ = self.unpack(cmd, "<hhhhhb", data)
+            else:
+                y,p,r = self.unpack(cmd, "<hhh", data)
             self.last_volt_t = time.time()
             self.voltages = (r*0.001,p*0.001,y*0.001)
             self.send_named_float('VLT_R', self.voltages[0])
             self.send_named_float('VLT_P', self.voltages[1])
             self.send_named_float('VLT_Y', self.voltages[2])
-            self.logf.write('SIVL', 'QfffBI', 'TimeUS,R,P,Y,Mode,ModeMS',
+            self.logf.write('SIVL', 'Qfff', 'TimeUS,R,P,Y',
                             self.micros64(),
-                            self.voltages[0], self.voltages[1], self.voltages[2],
-                            mode, mode_ms)
-            self.control_mode = mode
+                            self.voltages[0], self.voltages[1], self.voltages[2])
 
         elif cmd == READ_THRESHOLDS:
             climit,volt_thresh,ang_thresh, = self.unpack(cmd, "<hhh", data)
@@ -896,7 +1013,11 @@ class SIYIModule(mp_module.MPModule):
             self.logf.write('SITH', 'Qhhh', 'TimeUS,WLimit,VThresh,AErr',
                             self.micros64(),
                             climit, volt_thresh, ang_thresh)
-            if self.master.motors_armed():
+
+            do_strong_gimballing = self.master.motors_armed()
+            if self.siyi_settings.force_strong_gimballing:
+                do_strong_gimballing = True
+            if do_strong_gimballing:
                 new_thresh = (self.siyi_settings.thresh_climit,
                               self.siyi_settings.thresh_volt,
                               self.siyi_settings.thresh_ang)
@@ -930,12 +1051,13 @@ class SIYIModule(mp_module.MPModule):
             self.send_named_float('TMAX', self.tmax)
             self.last_temp_t = time.time()
             frame_counter = -1 if self.thermal_view is None else self.thermal_view.frame_counter
-            self.logf.write('SITR', 'QffHHHHi', 'TimeUS,TMin,TMax,TMinX,TMinY,TMaxX,TMaxY,FC',
+            self.logf.write('SITR', 'QffHHHHiI', 'TimeUS,TMin,TMax,TMinX,TMinY,TMaxX,TMaxY,FC,TCAP',
                             self.micros64(),
                             self.tmin, self.tmax,
                             self.tmin_x, self.tmin_y,
                             self.tmax_x, self.tmax_y,
-                            frame_counter)
+                            frame_counter,
+                            self.thermal_capture_count)
             if self.thermal_view is not None:
                 threshold = self.siyi_settings.threshold_temp
                 threshold_value = int(255*(threshold - self.tmin)/max(1,(self.tmax-self.tmin)))
@@ -1005,6 +1127,19 @@ class SIYIModule(mp_module.MPModule):
             ok, = self.unpack(cmd,"<B", data)
             print("SetTime: %u" % ok)
             
+        elif cmd in [GET_THERMAL_THRESH_STATE, SET_THERMAL_THRESH_STATE]:
+            ok, = self.unpack(cmd,"<B", data)
+            print("ThermalThreshState: %u" % ok)
+
+        elif cmd in [SET_THERMAL_THRESH]:
+            ok, = self.unpack(cmd,"<B", data)
+            print("SetThermThresh: %u" % ok)
+            
+        elif cmd == GET_THERMAL_THRESH:
+            sw1,t1min,t1max,r1,g1,b1,sw2,t2min,t2max,r2,g2,b2,sw3,t3min,t3max,r3,g3,b3, = self.unpack(cmd,"<BhhBBB BhhBBB BhhBBB", data)
+            print("ThermalThresh: %u(%d:%d %u,%u,%u) %u(%d:%d %u,%u,%u) %u(%d:%d %u,%u,%u)" % (
+                sw1,t1min,t1max,r1,g1,b1,sw2,t2min,t2max,r2,g2,b2,sw3,t3min,t3max,r3,g3,b3))
+            
         elif cmd in [SET_ANGLE, CENTER, GIMBAL_ROTATION, ABSOLUTE_ZOOM, SET_IMAGE_TYPE,
                      REQUEST_CONTINUOUS_DATA, SET_THERMAL_PALETTE, MANUAL_ZOOM_AND_AUTO_FOCUS]:
             # an ack
@@ -1016,6 +1151,8 @@ class SIYIModule(mp_module.MPModule):
         '''update thermal view title'''
         if self.thermal_view is not None:
             self.thermal_view.update_title()
+        if self.rawthermal_view is not None:
+            self.rawthermal_view.update_title()
         if self.rgb_view is not None:
             self.rgb_view.update_title()
 
@@ -1042,26 +1179,6 @@ class SIYIModule(mp_module.MPModule):
         if self.pitch_end is not None and now >= self.pitch_end:
             self.pitch_rate = 0
             self.pitch_end = None
-
-    def send_named_float(self, name, value):
-        '''inject a NAMED_VALUE_FLOAT into the local master input, so it becomes available
-           for graphs, logging and status command'''
-
-        # use the ATTITUDE message for srcsystem and time stamps
-        att = self.master.messages.get('ATTITUDE',None)
-        if att is None:
-            return
-        msec = att.time_boot_ms
-        ename = name.encode('ASCII')
-        if len(ename) < 10:
-            ename += bytes([0] * (10-len(ename)))
-        m = self.master.mav.named_value_float_encode(msec, bytearray(ename), value)
-        #m.name = ename
-        m.pack(self.master.mav)
-        m._header.srcSystem = att._header.srcSystem
-        m._header.srcComponent = mavutil.mavlink.MAV_COMP_ID_TELEMETRY_RADIO
-        m.name = name
-        self.mpstate.module('link').master_callback(m, self.master)
 
     def get_encoder_attitude(self):
         '''get attitude from encoders in vehicle frame'''
@@ -1116,80 +1233,34 @@ class SIYIModule(mp_module.MPModule):
          get range to ground
          x and y are from -1 to 1, relative to center of camera view
         '''
-        if self.rf_dist > 0 and self.siyi_settings.use_lidar > 0:
-            # use rangefinder if enabled
-            return self.rf_dist
-        gpi = self.master.messages.get('GLOBAL_POSITION_INT',None)
-        if not gpi:
-            return None
-        (lat,lon,alt) = gpi.lat*1.0e-7,gpi.lon*1.0e-7,gpi.alt*1.0e-3
-        ground_alt = self.module('terrain').ElevationModel.GetElevation(lat, lon)
-        if alt <= ground_alt:
-            return None
-        if self.attitude is None:
-            return None
+        C = camera_projection.CameraParams(xresolution=1024, yresolution=int(1024/aspect_ratio), FOV=FOV)
+        cproj = camera_projection.CameraProjection(C, elevation_model=self.module('terrain').ElevationModel)
         fov_att = self.get_fov_attitude()
-        pitch = fov_att[1]
-        if pitch >= 0:
-            return None
-        pitch -= y*FOV*0.5/aspect_ratio
-        pitch = min(pitch, -1)
-
-        # start with flat earth
-        sin_pitch = math.sin(abs(math.radians(pitch)))
-        sr = (alt-ground_alt) / sin_pitch
-
-        # iterate to make more accurate
-        for i in range(3):
-            (lat2,lon2,alt2) = self.get_latlonalt(sr,x,y,FOV,aspect_ratio)
-            ground_alt2 = self.module('terrain').ElevationModel.GetElevation(lat2, lon2)
-            if ground_alt2 is None:
-                return None
-            # adjust for height at this point
-            sr += (alt2 - ground_alt2) / sin_pitch
-        return sr
-
-
-
-    def get_view_vector(self, x, y, FOV, aspect_ratio):
-        '''
-        get ground lat/lon given vehicle orientation, camera orientation and slant range
-        x and y are from -1 to 1, relative to center of camera view
-        positive x is to the right
-        positive y is down
-        '''
         att = self.master.messages.get('ATTITUDE',None)
-        if att is None:
+        gpi = self.master.messages.get('GLOBAL_POSITION_INT',None)
+        GPS_RAW_INT = self.master.messages['GPS_RAW_INT']
+        if gpi is None or att is None or GPS_RAW_INT is None:
             return None
-        v = Vector3(1, 0, 0)
-        m = Matrix3()
-        fov_att = self.get_fov_attitude()
-        (roll,pitch,yaw) = (math.radians(fov_att[0]),math.radians(fov_att[1]),math.radians(fov_att[2]))
-        yaw += att.yaw
-        FOV_half = math.radians(0.5*FOV)
-        yaw += FOV_half*x
-        pitch -= y*FOV_half/aspect_ratio
-        m.from_euler(roll, pitch, yaw)
-        v = m * v
-        return v
+        myalt = GPS_RAW_INT.alt*1.0e-3 + self.siyi_settings.mount_alt
+        return cproj.get_slantrange(gpi.lat*1.0e-7,gpi.lon*1.0e-7,myalt,fov_att[0],fov_att[1],fov_att[2]+math.degrees(att.yaw))
 
-    def get_latlonalt(self, slant_range, x, y, FOV, aspect_ratio):
+    def get_latlonalt(self, slant_range, x, y, FOV, aspect_ratio, fov_att=None):
         '''
         get ground lat/lon given vehicle orientation, camera orientation and slant range
         x and y are from -1 to 1, relative to center of camera view
         '''
-        if slant_range is None:
-            return None
-        v = self.get_view_vector(x,y,FOV,aspect_ratio)
-        if v is None:
-            return None
+        C = camera_projection.CameraParams(xresolution=1024, yresolution=int(1024/aspect_ratio), FOV=FOV)
+        cproj = camera_projection.CameraProjection(C, elevation_model=self.module('terrain').ElevationModel)
+        px = int(C.xresolution * 0.5*(1+x))
+        py = int(C.yresolution * 0.5*(1+y))
+        fov_att = self.get_fov_attitude()
+        att = self.master.messages.get('ATTITUDE',None)
         gpi = self.master.messages.get('GLOBAL_POSITION_INT',None)
-        if gpi is None:
+        GPS_RAW_INT = self.master.messages['GPS_RAW_INT']
+        if gpi is None or att is None or GPS_RAW_INT is None:
             return None
-        v *= slant_range
-        (lat,lon,alt) = (gpi.lat*1.0e-7,gpi.lon*1.0e-7,gpi.alt*1.0e-3)
-        (lat,lon) = mp_util.gps_offset(lat,lon,v.y,v.x)
-        return (lat,lon,alt-v.z)
+        myalt = GPS_RAW_INT.alt*1.0e-3 + self.siyi_settings.mount_alt
+        return cproj.get_latlonalt_for_pixel(px, py, gpi.lat*1.0e-7,gpi.lon*1.0e-7,myalt,fov_att[0],fov_att[1],fov_att[2]+math.degrees(att.yaw))
 
     def get_target_yaw_pitch(self, lat, lon, alt, mylat, mylon, myalt, vehicle_yaw_rad):
         '''get target yaw/pitch in vehicle frame for a target lat/lon'''
@@ -1229,11 +1300,12 @@ class SIYIModule(mp_module.MPModule):
         self.last_target_send = now
 
         GLOBAL_POSITION_INT = self.master.messages['GLOBAL_POSITION_INT']
+        GPS_RAW_INT = self.master.messages['GPS_RAW_INT']
         ATTITUDE = self.master.messages['ATTITUDE']
         lat, lon, alt = self.target_pos
         mylat = GLOBAL_POSITION_INT.lat*1.0e-7
         mylon = GLOBAL_POSITION_INT.lon*1.0e-7
-        myalt = GLOBAL_POSITION_INT.alt*1.0e-3
+        myalt = GPS_RAW_INT.alt*1.0e-3 + self.siyi_settings.mount_alt
 
         dt = now - GLOBAL_POSITION_INT._timestamp
         vn = GLOBAL_POSITION_INT.vx*0.01
@@ -1278,7 +1350,7 @@ class SIYIModule(mp_module.MPModule):
         err_pitch += self.siyi_settings.mount_pitch
 
         self.yaw_rate = self.yaw_controller.run(err_yaw, los_yaw_rate)
-        self.pitch_rate = self.yaw_controller.run(err_pitch, los_pitch_rate)
+        self.pitch_rate = self.pitch_controller.run(err_pitch, los_pitch_rate)
         self.send_named_float('EYAW', err_yaw)
         self.send_named_float('EPITCH', err_pitch)
         self.logf.write('SIPY', "Qfffff", "TimeUS,CYaw,TYaw,Yerr,I,FF",
@@ -1289,15 +1361,19 @@ class SIYIModule(mp_module.MPModule):
     def show_fov1(self, FOV, name, aspect_ratio, color):
         '''show one FOV polygon'''
         points = []
-        for (x,y) in [(-1,-1),(1,-1),(1,1),(-1,1),(-1,-1)]:
-            latlonalt = self.get_latlonalt(self.get_slantrange(x,y,FOV,aspect_ratio),x,y,FOV,aspect_ratio)
-            if latlonalt is None:
-                self.mpstate.map.remove_object(name)
-                return
-            (lat,lon) = (latlonalt[0],latlonalt[1])
-            points.append((lat,lon))
-        self.mpstate.map.add_object(mp_slipmap.SlipPolygon(name, points, layer='SIYI',
-                                                           linewidth=2, colour=color))
+        C = camera_projection.CameraParams(xresolution=1024, yresolution=int(1024/aspect_ratio), FOV=FOV)
+        cproj = camera_projection.CameraProjection(C, elevation_model=self.module('terrain').ElevationModel)
+        fov_att = self.get_fov_attitude()
+        att = self.master.messages.get('ATTITUDE',None)
+        gpi = self.master.messages.get('GLOBAL_POSITION_INT',None)
+        GPS_RAW_INT = self.master.messages['GPS_RAW_INT']
+        if gpi is None or att is None or GPS_RAW_INT is None:
+            return None
+        myalt = GPS_RAW_INT.alt*1.0e-3 + self.siyi_settings.mount_alt
+        points = cproj.get_projection(gpi.lat*1.0e-7,gpi.lon*1.0e-7,myalt,fov_att[0],fov_att[1],fov_att[2]+math.degrees(att.yaw))
+        if points is not None:
+            self.mpstate.map.add_object(mp_slipmap.SlipPolygon(name, points, layer='SIYI',
+                                                               linewidth=2, colour=color))
 
     def show_fov(self):
         '''show FOV polygons'''
@@ -1307,19 +1383,155 @@ class SIYIModule(mp_module.MPModule):
             FOV2 = self.siyi_settings.zoom_fov / self.last_zoom
         self.show_fov1(FOV2, 'FOV_RGB', 1280.0/720.0, (0,128,128))
 
+    def camera_click(self, mode, latlonalt):
+        '''handle click on camera window'''
+        latlon = (latlonalt[0], latlonalt[1])
+
+        # set click location for other commands
+        self.mpstate.click_location = latlon
+
+        if mode == 'ClickTrack':
+            self.set_target(latlonalt[0], latlonalt[1], latlonalt[2])
+        else:
+            self.mpstate.map.add_object(
+                mp_slipmap.SlipIcon("SIYIClick", latlon, self.click_icon, layer="SIYI")
+                )
+
+    def handle_marker(self, marker):
+        '''handle marker menu on image'''
+        map = self.module('map')
+        if map:
+            map.cmd_map_marker([marker])
+
     def end_tracking(self):
         '''end all tracking'''
         if self.rgb_view is not None:
             self.rgb_view.end_tracking()
         if self.thermal_view is not None:
             self.thermal_view.end_tracking()
+        if self.rawthermal_view is not None:
+            self.rawthermal_view.end_tracking()
+
+    def armed_checks(self):
+        '''checks for armed/disarmed'''
+        now = time.time()
+        armed = self.master.motors_armed()
+        if armed and not self.last_armed:
+            print("Setting SIYI time")
+            self.cmd_settime()
+            print("Enabling thermal capture")
+            self.siyi_settings.therm_cap_rate = 1.0
+        if not armed and self.last_armed:
+            print("Disabling thermal capture")
+            self.siyi_settings.therm_cap_rate = 0.0
+        self.last_armed = armed
+        if now - self.last_getconfig > 5:
+            self.getconfig_pending = True
+            self.last_getconfig = now
+            self.send_packet(ACQUIRE_GIMBAL_CONFIG_INFO, None)
+
+    def save_DATA96(self, data):
+        '''save data from a DATA96 message'''
+        dname = os.path.join(self.logdir, 'thermal_data')
+        try:
+            os.mkdir(dname)
+        except Exception as ex:
+            pass
+        now = time.time()
+        tstr = datetime.datetime.fromtimestamp(now).strftime("%Y_%m_%d_%H_%M_%S")
+        subsec = now - math.floor(now)
+        millis = int(subsec * 1000)
+        fname = "data_%s_%03u.dat" % (tstr, millis)
+        open(os.path.join(dname, fname),'wb').write(data)
+
+    def process_DATA96(self, data):
+        '''handle data from SIYI_control.lua'''
+        msec,lat, lon, alt, gps_alt, tmax, tmax_x, tmax_y, siyi_roll, siyi_pitch, siyi_yaw, roll, pitch, yaw = struct.unpack("<iiifffHHffffff", data)
+        if not self.siyi_settings.autoflag_enable or tmax < self.siyi_settings.autoflag_temp:
+            return
+
+        lat = lat * 1.0e-7
+        lon = lon * 1.0e-7
+
+        thermal_width = 640
+        thermal_height = 512
+        aspect_ratio = thermal_width / float(thermal_height)
+        FOV = self.siyi_settings.thermal_fov
+        C = camera_projection.CameraParams(xresolution=thermal_width, yresolution=thermal_height, FOV=FOV)
+        cproj = camera_projection.CameraProjection(C, elevation_model=self.module('terrain').ElevationModel)
+        slant_range = cproj.get_slantrange(lat,lon,gps_alt+self.siyi_settings.mount_alt,siyi_roll,siyi_pitch-self.siyi_settings.mount_pitch,siyi_yaw+yaw-self.siyi_settings.mount_yaw)
+        if slant_range is None:
+            return
+        x = (tmax_x/thermal_width) * 2 - 1.0
+        y = (tmax_y/thermal_height) * 2 - 1.0
+        fov_att = (siyi_roll, siyi_pitch-self.siyi_settings.mount_pitch, mp_util.wrap_180(siyi_yaw-self.siyi_settings.mount_yaw))
+        latlonalt = cproj.get_latlonalt_for_pixel(tmax_x, tmax_y, lat, lon, gps_alt, fov_att[0], fov_att[1], fov_att[2]+yaw)
+        if latlonalt is None:
+            return
+        latlon = latlonalt[0], latlonalt[1]
+        if self.last_map_ROI:
+            (roi_lat, roi_lon, roi_alt) = self.last_map_ROI
+            roi_dist = mp_util.gps_distance(latlon[0], latlon[1], roi_lat, roi_lon)
+            if roi_dist > self.siyi_settings.autoflag_radius:
+                #print("roi_dist: ", roi_dist, lat, lon, roi_lat, roi_lon)
+                return
+
+        icon = self.mpstate.map.icon('flame.png')
+        self.mpstate.map.add_object(mp_slipmap.SlipIcon(
+            'icon [%u]' % msec,
+            (float(latlon[0]),float(latlon[1])),
+            icon, layer='thermal_flag', rotation=0, follow=False))
+
+    def handle_DATA96(self, m):
+        '''handle data from SIYI_control.lua'''
+        self.have_DATA96 = True
+        data = bytes(m.data[:m.len])
+        self.thermal_data_count = self.thermal_data_count + 1
+        self.console.set_status('TDAT', 'TDAT %u' % self.thermal_data_count, row=6)
+        self.save_DATA96(data)
+        self.process_DATA96(data)
+
+    def autoflag_clear(self):
+        '''clear auto flagged locations'''
+        self.mpstate.map.add_object(mp_slipmap.SlipClearLayer('thermal_flag'))
+
+    def autoflag_reload(self):
+        '''reload auto flagged locations'''
+        dname = os.path.join(self.logdir, 'thermal_data')
+        try:
+            dlist = os.listdir(dname)
+        except Exception as ex:
+            print(ex)
+            return
+        self.autoflag_clear()
+        for d in sorted(dlist):
+            if not d.startswith('data_') or not d.endswith('.dat'):
+                continue
+            data = open(os.path.join(dname, d),'rb').read()
+            if len(data) != 52:
+                continue
+            self.process_DATA96(data)
+
+    def autoflag_discard(self):
+        '''discard flagged locations'''
+        dname = os.path.join(self.logdir, 'thermal_data')
+        try:
+            dlist = os.listdir(dname)
+        except Exception as ex:
+            print(ex)
+            return
+        self.autoflag_clear()
+        for d in dlist:
+            os.unlink(os.path.join(dname, d))
 
     def mavlink_packet(self, m):
         '''process a mavlink message'''
         mtype = m.get_type()
+
+        self.armed_checks()
+
         if mtype == 'GPS_RAW_INT':
-            # ?!? why off by 18 hours
-            gwk, gms = mp_util.get_gps_time(time.time()+18*3600)
+            gwk, gms = mp_util.get_gps_time(time.time())
             self.logf.write('GPS', "QBIHLLff", "TimeUS,Status,GMS,GWk,Lat,Lng,Alt,Spd",
                             self.micros64(), m.fix_type, gms, gwk, m.lat, m.lon, m.alt*0.001, m.vel*0.01)
         if mtype == 'ATTITUDE':
@@ -1332,6 +1544,20 @@ class SIYIModule(mp_module.MPModule):
                 self.show_fov()
             except Exception as ex:
                 print(traceback.format_exc())
+        elif mtype == 'EXTENDED_SYS_STATE':
+            if self.siyi_settings.stow_on_landing:
+                self.extended_sys_state_received_time = time.time()
+                if (m.landed_state == mavutil.mavlink.MAV_LANDED_STATE_LANDING and
+                    self.last_landed_state != mavutil.mavlink.MAV_LANDED_STATE_LANDING):
+                    # we've just transition into landing
+                    self.retract()
+                self.last_landed_state = m.landed_state
+        elif mtype == 'DATA96' and m.type == 71:
+            self.handle_DATA96(m)
+
+    def retract(self):
+        print("SIYI: stowing camera")
+        self.cmd_angle([0, 0])
 
     def receive_thread(self):
         '''thread for receiving UDP packets from SIYI'''
@@ -1368,9 +1594,76 @@ class SIYIModule(mp_module.MPModule):
         self.update_target()
         self.send_rates()
         self.request_telem()
-        self.send_attitude()
+        if not self.have_DATA96:
+            self.send_attitude()
         self.check_thermal_events()
         self.therm_capture()
+
+        # we need EXTENDED_SYS_STATE to work out if we're landing:
+        if self.siyi_settings.stow_on_landing:
+            now = time.time()
+            delta_t = now - self.extended_sys_state_received_time
+            delta_sent_t = now - self.extended_sys_state_request_time
+            if delta_t > 5 and delta_sent_t > 5:
+                self.extended_sys_state_request_time = now
+                self.master.mav.command_long_send(
+                    1,   # FIXME, target_system
+                    1,   # FIXME, target_component
+                    mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+                    0,   # confirmation
+                    mavutil.mavlink.MAVLINK_MSG_ID_EXTENDED_SYS_STATE,  # p1
+                    1e6, #p2 interval (microseconds)
+                    0,   #p3 instance
+                    0,
+                    0,
+                    0,
+                    0
+                )
+            delta_warn_t = now - self.extended_sys_state_warn_time
+            if delta_t > 60 and delta_warn_t > 60:
+                self.extended_sys_state_warn_time = now
+                print("SIYI: no EXTENDED_SYS_STATE, can't auto-stow")
+
+        if self.siyi_settings.stow_heuristics_enabled:
+            self.check_stow_on_landing_heuristics()
+
+    def check_stow_on_landing_heuristics(self):
+        tr = self.master.messages.get('TERRAIN_REPORT', None)
+        vfr_hud = self.master.messages.get('VFR_HUD', None)
+
+        if tr is None or vfr_hud is None:
+            now = time.time()
+            if now - self.landing_heuristics["last_warning_ms"] > 60:
+                self.landing_heuristics["last_warning_ms"] = now
+                print("SIYI: missing messages, hueristics-stow not available")
+            return
+
+        # first work out whether we should "arm" the stowing; must
+        # meet minimum conditions to do so:
+        current_terrain_alt = tr.current_height
+        if current_terrain_alt > self.siyi_settings.stow_heuristics_minalt + 1:
+            # above trigger altitude
+            self.landing_heuristics["armed"] = True
+
+        # now work out whether to stow:
+        if not self.landing_heuristics["armed"]:
+            return
+
+        if current_terrain_alt > self.siyi_settings.stow_heuristics_minalt:
+            # above the minimum altitude
+            return
+
+        if vfr_hud.groundspeed > self.siyi_settings.stow_heuristics_maxhorvel:
+            # travelling rapidly horizontally
+            return
+
+        if vfr_hud.climb > 0:
+            # climbing
+            return
+
+
+        self.landing_heuristics["armed"] = False
+        self.retract()
 
     def show_horizon_lines(self):
         '''show horizon lines'''
@@ -1391,6 +1684,7 @@ class SIYIModule(mp_module.MPModule):
         '''remove horizon lines'''
         self.rgb_view.im.add_OSD(MPImageOSD_None('hor1'))
         self.rgb_view.im.add_OSD(MPImageOSD_None('hor2'))
+
 
 def init(mpstate):
     '''initialise module'''

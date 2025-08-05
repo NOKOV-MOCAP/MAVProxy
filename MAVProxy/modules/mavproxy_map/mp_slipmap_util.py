@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 '''
 slipmap based on mp_tile
@@ -16,6 +16,8 @@ import warnings
 
 from MAVProxy.modules.mavproxy_map import mp_tile
 from MAVProxy.modules.lib import mp_util
+
+font = cv2.FONT_HERSHEY_DUPLEX
 
 def image_shape(img):
     '''handle different image formats, returning (width,height) tuple'''
@@ -100,7 +102,7 @@ class SlipLabel(SlipObject):
 
     def draw_label(self, img, pixmapper):
         pix1 = pixmapper(self.point)
-        cv2.putText(img, self.label, pix1, cv2.FONT_HERSHEY_SIMPLEX, self.size, self.colour)
+        cv2.putText(img, self.label, pix1, font, self.size, self.colour)
 
     def draw(self, img, pixmapper, bounds):
         if self.hidden:
@@ -214,7 +216,7 @@ class SlipCircle(SlipObject):
 
 class SlipPolygon(SlipObject):
     '''a polygon to display on the map'''
-    def __init__(self, key, points, layer, colour, linewidth, arrow = False, popup_menu=None, showlines=True):
+    def __init__(self, key, points, layer, colour, linewidth, arrow = False, popup_menu=None, showlines=True, showcircles=True):
         SlipObject.__init__(self, key, layer, popup_menu=popup_menu)
         self.points = points
         self.colour = colour
@@ -225,6 +227,10 @@ class SlipPolygon(SlipObject):
         self._selected_vertex = None
         self._has_timestamps = False
         self._showlines = showlines
+        self._showcircles = showcircles
+
+    def set_colour(self, colour):
+        self.colour = colour
 
     def bounds(self):
         '''return bounding box'''
@@ -247,7 +253,8 @@ class SlipPolygon(SlipObject):
             return
         if self._showlines:
             cv2.line(img, pix1, pix2, colour, linewidth)
-        cv2.circle(img, pix2, linewidth*2, colour)
+        if self._showcircles:
+            cv2.circle(img, pix2, linewidth*2, colour)
         if len(self._pix_points) == 0:
             self._pix_points.append(pix1)
         self._pix_points.append(pix2)
@@ -354,11 +361,10 @@ class SlipGrid(SlipObject):
         (lat,lon,w,h) = bounds
         # note that w and h are in degrees
         spacing = 1000
+        lat2 = mp_util.constrain(lat+h*0.5,-85,85)
+        lon2 = mp_util.wrap_180(lon+w)
+        dist = mp_util.gps_distance(lat2,lon,lat2,lon2)
         while True:
-            start = mp_util.latlon_round((lat,lon), spacing)
-            lat2 = mp_util.constrain(lat+h*0.5,-85,85)
-            lon2 = mp_util.wrap_180(lon+w)
-            dist = mp_util.gps_distance(lat2,lon,lat2,lon2)
             count = int(dist / spacing)
             if count < 2:
                 spacing /= 10.0
@@ -368,6 +374,8 @@ class SlipGrid(SlipObject):
                 break
 
         count += 10
+
+        start = mp_util.latlon_round((lat,lon), spacing)
 
         for i in range(count):
             # draw vertical lines of constant longitude
@@ -401,7 +409,6 @@ class SlipFlightModeLegend(SlipObject):
         self.font_scale = 0.5
 
     def draw_legend(self):
-        font = cv2.FONT_HERSHEY_SIMPLEX
         fontscale = self.font_scale
         width = 0
         height = self.top_margin + self.bottom_margin
@@ -454,6 +461,8 @@ class SlipThumbnail(SlipObject):
         SlipObject.__init__(self, key, layer, popup_menu=popup_menu)
         self.latlon = latlon
         self._img = None
+        if isinstance(img, str):
+            img = mp_tile.mp_icon(img)
         if not hasattr(img, 'shape'):
             img = np.asarray(img[:,:])
         self.original_img = img
@@ -581,7 +590,7 @@ class SlipIcon(SlipThumbnail):
         img[py:py + h, px:px + w] = cv2.add(img[py:py+h, px:px+w], icon[sy:sy+h, sx:sx+w])
 
         if self.label is not None:
-            cv2.putText(img, self.label, (px,py), cv2.FONT_HERSHEY_SIMPLEX, 1.0, self.colour)
+            cv2.putText(img, self.label, (px,py), font, 1.0, self.colour)
         
         # remember where we placed it for clicked()
         self.posx = px+w//2

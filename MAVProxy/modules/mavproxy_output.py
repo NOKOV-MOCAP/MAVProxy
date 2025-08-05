@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 '''enable run-time addition and removal of UDP clients , just like --out on the cnd line'''
 ''' TO USE:
     output add 10.11.12.13:14550
@@ -57,7 +57,7 @@ class OutputModule(mp_module.MPModule):
         device = args[0]
         print("Adding output %s" % device)
         try:
-            conn = mavutil.mavlink_connection(device, input=False, source_system=self.settings.source_system)
+            conn = mavutil.mavlink_connection(device, input=False, source_system=self.settings.source_system, autoreconnect=True)
             conn.mav.srcComponent = self.settings.source_component
         except Exception:
             print("Failed to connect to %s" % device)
@@ -74,7 +74,7 @@ class OutputModule(mp_module.MPModule):
         device = args[1]
         print("Adding output %s for sysid %u" % (device, sysid))
         try:
-            conn = mavutil.mavlink_connection(device, input=False, source_system=self.settings.source_system)
+            conn = mavutil.mavlink_connection(device, input=False, source_system=self.settings.source_system, autoreconnect=True)
             conn.mav.srcComponent = self.settings.source_component
         except Exception:
             print("Failed to connect to %s" % device)

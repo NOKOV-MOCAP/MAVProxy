@@ -26,7 +26,6 @@ class CameraView:
         self.res = res
         self.rtsp_url = rtsp_url
         self.filename = filename
-        self.mode = "Flag"
         self.last_frame_t = time.time()
         self.fps = fps
         self.frame_counter = -1
@@ -93,14 +92,19 @@ class CameraView:
                 popup.add_to_submenu(
                     ["Zoom"], MPMenuItem("%ux" % z, returnkey="Zoom:%u" % z)
                 )
+        popup.add_to_submenu(["Marker"], MPMenuItem("Flame", returnkey="Marker:flame"))
+        popup.add_to_submenu(["Marker"], MPMenuItem("Flag", returnkey="Marker:flag"))
+        popup.add_to_submenu(["Marker"], MPMenuItem("Barrell", returnkey="Marker:barrell"))
 
-        gst_pipeline = "rtspsrc location={0} latency=0 buffer-mode=auto ! rtph265depay !  tee name=tee1 tee1. ! queue ! h265parse ! avdec_h265  ! videoconvert ! video/x-raw,format=BGRx ! appsink tee1. ! queue ! h265parse config-interval=15 ! video/x-h265 ! mpegtsmux ! filesink location={1}".format(
+        gst_pipeline = "rtspsrc location={0} latency=0 protocols=tcp tcp-timeout=3000000 buffer-mode=auto ! rtph265depay !  tee name=tee1 tee1. ! queue ! h265parse ! avdec_h265  ! videoconvert ! video/x-raw,format=BGRx ! appsink tee1. ! queue ! h265parse config-interval=15 ! video/x-h265 ! mpegtsmux ! filesink location={1}".format(
             self.rtsp_url, self.filename
         )
 
         self.im.set_gstreamer(gst_pipeline)
         if self.thermal:
             self.im.set_colormap(self.im_colormap)
+        self.im.set_colormap("None")
+        self.siyi.cmd_palette(["WhiteHot"])
 
     def create_colormap_threshold(self, threshold):
         '''create a yellow->red colormap for a given threshold'''
@@ -137,6 +141,7 @@ class CameraView:
         """set image title"""
         if self.im is None:
             return
+        title += " (mode %s)" % self.siyi.click_mode
         self.im.set_title(title)
 
     def get_pixel_temp(self, event):
@@ -170,7 +175,7 @@ class CameraView:
         elif self.siyi.rgb_lens == "zoom":
             self.set_title("Zoom View %.1fx" % self.siyi.last_zoom)
         else:
-            self.set_title("Wide View")
+            self.set_title("Wide View (frame %u)" % self.frame_counter)
 
     def xy_to_latlon(self, x, y, shape):
         '''convert x,y pixel coordinates to a latlon tuple'''
@@ -210,8 +215,10 @@ class CameraView:
                     self.im.set_colormap(event.returnkey[9:])
                     self.siyi.cmd_palette(["WhiteHot"])
                 elif event.returnkey.startswith("Mode:"):
-                    self.mode = event.returnkey[5:]
-                    print("ViewMode: %s" % self.mode)
+                    self.siyi.click_mode = event.returnkey[5:]
+                    print("ViewMode: %s" % self.siyi.click_mode)
+                elif event.returnkey.startswith("Marker:"):
+                    self.siyi.handle_marker(event.returnkey[7:])
                 elif event.returnkey.startswith("Lens:") and self.siyi is not None:
                     self.siyi.cmd_imode([event.returnkey[5:]])
                 elif event.returnkey.startswith("Zoom:") and self.siyi is not None:
@@ -255,13 +262,8 @@ class CameraView:
                     self.tracking = True
                 elif event.controlDown:
                     self.siyi.end_tracking()
-                elif self.mode == "ClickTrack":
-                    self.siyi.set_target(latlonalt[0], latlonalt[1], latlonalt[2])
                 else:
-                    latlon = (latlonalt[0], latlonalt[1])
-                    self.siyi.mpstate.map.add_object(
-                        mp_slipmap.SlipIcon("SIYIClick", latlon, self.siyi.click_icon, layer="SIYI")
-                    )
+                    self.siyi.camera_click(self.siyi.click_mode, latlonalt)
 
 if __name__ == '__main__':
     from optparse import OptionParser
