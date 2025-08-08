@@ -8,6 +8,7 @@ import time
 from MAVProxy.modules.lib import mp_module
 from MAVProxy.modules.lib import mp_settings
 #from MAVProxy.modules.mavproxy_nokov.nokov import nokovsdk
+from nokov import nokovsdk
 
 Descriptor_MarkerSet = 0
 Descriptor_RigidBody = 1
@@ -72,11 +73,11 @@ class NokovModule(mp_module.MPModule):
         print('serverIp is %s' % self.nokov_settings.host)
         client = nokovsdk.PySDKClient()
         ver = client.PyNokovVersion()
-        print('SeekerSDK ver. %d.%d.%d.%d' % (ver[0], ver[1], ver[2], ver[3]))
+        print('NokovSDK ver. %d.%d.%d.%d' % (ver[0], ver[1], ver[2], ver[3]))
         client.PySetDataCallback(py_data_func, None)
         ret = client.Initialize(bytes(self.nokov_settings.host, encoding="utf8"))
         if ret == 0:
-            print("Connect to the Seeker Succeed")
+            print("Connect to the XINGYING Succeed")
             dsc = nokovsdk.DataDescriptions()
             handle = nokovsdk.c_void_p()
             ret = client.PyGetDataDescriptionsEx(dsc, handle)
